@@ -22,6 +22,7 @@ import { Browser, Page, LaunchOptions, ElementHandle } from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
 import getAiGeneratedText from '../services/generativeAI';
+import { execFile } from 'child_process';
 
 // Enable stealth plugin
 puppeteer.use(StealthPlugin());
@@ -31,8 +32,340 @@ export interface KeywordIdea {
   query: string;
 }
 
+// Build a styled HTML report (matches required format with headers and 2 tables)
+function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: string, narrativeHtml?: string): string {
+  const date = new Date();
+  const auditDate = date.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+  const yesNo = (b: any) => (b ? 'Yes' : 'No');
+
+  // Compute basic competitor stats for "Profile Authority"
+  const compReviews: number[] = [];
+  rows.forEach(r => {
+    const d = r.competitorDetails || ({} as any);
+    const n = parseInt(String(d.reviews || d.reviewCount || '0').replace(/[^0-9]/g, '')) || 0;
+    if (n > 0) compReviews.push(n);
+  });
+  const compAvgReviews = compReviews.length ? Math.round(compReviews.reduce((a,b)=>a+b,0)/compReviews.length) : 0;
+  let authority = 'Unclear';
+  if (compAvgReviews >= 500) authority = 'Strong';
+  else if (compAvgReviews >= 150) authority = 'Moderate';
+
+  // Build unique competitor table (merge best-available fields)
+  const compMap = new Map<string, any>();
+  rows.forEach(r => {
+    const d = r.competitorDetails || ({} as any);
+    const key = (r.topCompetitor || 'N/A') + '|' + (d.mapsUrl || r.mapsUrl || '');
+    if (!compMap.has(key)) {
+      compMap.set(key, {
+        name: r.topCompetitor || 'N/A',
+        d: {
+          ...d,
+          // merge in top-level fallbacks
+          rating: d.rating || r.rating,
+          averageRating: d.averageRating || r.rating,
+          reviews: d.reviews || r.reviews,
+          website: d.website || r.website,
+          hasDirections: typeof d.hasDirections === 'boolean' ? d.hasDirections : false,
+          posts: d.posts || '0',
+          scheduleAvailable: typeof d.scheduleAvailable === 'boolean' ? d.scheduleAvailable : (d.scheduleBtn === 'Yes'),
+          callAvailable: typeof d.callAvailable === 'boolean' ? d.callAvailable : (d.callBtn === 'Yes'),
+        }
+      });
+    }
+  });
+  const compRows = Array.from(compMap.values());
+
+  const esc = (s: any) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const firstNumeric = (...vals: any[]) => {
+    for (const v of vals) {
+      const str = (v ?? '').toString();
+      const m = str.match(/\d[\d,]*/);
+      if (m) return m[0].replace(/[^0-9]/g, '');
+    }
+    return '';
+  };
+  const firstRating = (...vals: any[]) => {
+    for (const v of vals) {
+      const str = (v ?? '').toString();
+      const m = str.match(/\d+(?:\.\d+)?/);
+      if (m) return m[0];
+    }
+    return '';
+  };
+
+  const keywordRowsHtml = rows.map(r => `
+      <tr>
+        <td>${esc(r.keyword)}</td>
+        <td>${esc(r.yourRanking)}</td>
+        <td>${esc(r.topCompetitor)}</td>
+        <td>${esc(r.theirRank)}</td>
+      </tr>`).join('\n');
+
+  const competitorRowsHtml = compRows.map(({name, d}) => {
+    const reviewsNum = firstNumeric(d.reviews, d.reviewCount);
+    const ratingNum = firstRating(d.rating, d.averageRating) || 'N/A';
+    const scheduleYes = (d.scheduleAvailable === true) || d.scheduleBtn === 'Yes';
+    const callYes = (d.callAvailable === true) || d.callBtn === 'Yes';
+    const websiteYes = !!(d.website && d.website !== 'N/A');
+    const dirsYes = !!d.hasDirections;
+    const postsVal = String(d.posts || '0');
+    return `
+      <tr>
+        <td>${esc(name)}</td>
+        <td>${websiteYes ? 'Yes' : 'No'}</td>
+        <td>${dirsYes ? 'Yes' : 'No'}</td>
+        <td>${esc(postsVal)}</td>
+        <td>${esc(reviewsNum)}</td>
+        <td>${esc(ratingNum)}</td>
+        <td>${scheduleYes ? 'Yes' : 'No'}</td>
+        <td>${callYes ? 'Yes' : 'No'}</td>
+      </tr>`;
+  }).join('\n');
+
+  // Styles approximating the required format
+  const css = `
+  @page { size: A4; margin: 15mm; }
+  @media print {
+    body { background: #fff !important; }
+    .container { box-shadow: none !important; border: 0; margin: 0; padding: 0; width: 180mm; }
+    .header { border-bottom: 1px solid #ddd; }
+    table { page-break-inside: auto; }
+    tr { page-break-inside: avoid; page-break-after: auto; }
+    h1,h2 { page-break-after: avoid; }
+  }
+  :root{--card:#ffffff;--muted:#6b7280;--primary:#1e3a8a;--accent:#2563eb;--border:#e5e7eb;--bg:#f8fafc}
+  *{box-sizing:border-box}body{font-family:Inter,system-ui,Arial,Helvetica,sans-serif;background:var(--bg);color:#0f172a;margin:0;padding:24px}
+  .container{max-width:980px;margin:0 auto;background:#fff;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.06);padding:24px}
+  .header{display:flex;align-items:center;justify-content:space-between;padding:8px 4px 20px;border-bottom:1px solid var(--border)}
+  .title{display:flex;align-items:center;gap:12px}
+  .title h1{margin:0;font-size:26px;color:var(--primary);letter-spacing:.4px}
+  .meta{font-size:13px;color:var(--muted)}
+  .snapshot{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:18px 0 8px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+  .card h4{margin:0 0 8px;color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.6px}
+  .card .value{font-size:20px;font-weight:700}
+  h2.section{margin:22px 0 12px;font-size:18px;color:#0f172a;display:flex;align-items:center;gap:8px}
+  table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  th,td{padding:10px 12px;border-bottom:1px solid var(--border);font-size:14px}
+  th{background:#f1f5f9;text-align:left;color:#0f172a}
+  tr:last-child td{border-bottom:none}
+  .grid-2{display:grid;grid-template-columns:1fr;gap:18px}
+  @media(min-width:900px){.grid-2{grid-template-columns:1fr}}
+  .note{font-size:12px;color:var(--muted)}
+  `;
+
+  return `<!doctype html>
+  <html>
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>GMB Audit Report — ${esc(biz.name)}</title>
+    <style>${css}</style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <div class="title">
+          <img alt="Google My Business" src="https://www.gstatic.com/images/icons/material/system_gm/1x/store_mall_directory_gm_blue_24dp.png" width="28"/>
+          <h1>GMB AUDIT REPORT</h1>
+        </div>
+        <div class="meta">
+          <div><strong>Profile:</strong> ${esc(biz.name)} — ${esc(biz.category || 'Business')}</div>
+          <div><strong>Location:</strong> ${esc(city || '-')}</div>
+          <div><strong>Audit Date:</strong> ${esc(auditDate)}</div>
+        </div>
+      </div>
+
+      <h2 class="section">Snapshot</h2>
+      <div class="snapshot">
+        <div class="card"><h4>GMB Posts</h4><div class="value">${esc(biz.posts || '0')}</div><div class="note"></div></div>
+        <div class="card"><h4>Reviews</h4><div class="value">${esc(biz.reviewCount || 'NA')} ${biz.averageRating && biz.averageRating !== 'N/A' ? `(Avg — ${esc(biz.averageRating)})` : ''}</div></div>
+        <div class="card"><h4>Website</h4><div class="value">${biz.website ? 'Yes' : 'No'}</div></div>
+        <div class="card"><h4>Directions / Call</h4><div class="value">${yesNo(biz.hasDirections)} / ${yesNo(biz.callAvailable)}</div></div>
+        <div class="card"><h4>“Schedule Now” on GMB</h4><div class="value">${yesNo(biz.scheduleAvailable)}</div></div>
+        <div class="card"><h4>Profile Authority</h4><div class="value">${authority}</div><div class="note">Top competitors avg ${compAvgReviews.toLocaleString()} reviews</div></div>
+      </div>
+
+      <h2 class="section">Current Keyword Rankings</h2>
+      <table>
+        <thead><tr><th>Keyword</th><th>Your Ranking</th><th>Top Competitor</th><th>Their Rank</th></tr></thead>
+        <tbody>
+          ${keywordRowsHtml}
+        </tbody>
+      </table>
+
+      <h2 class="section">Competitor Benchmarking — ${esc(city || 'Market')}</h2>
+      <table>
+        <thead><tr>
+          <th>Profile</th><th>Website</th><th>Directions</th><th>Posts</th><th>Total Reviews</th><th>Avg. Rating</th><th>Schedule Now</th><th>Call</th>
+        </tr></thead>
+        <tbody>
+          ${competitorRowsHtml}
+        </tbody>
+      </table>
+      ${narrativeHtml ? `
+      <h2 class="section">Key Insights & Recommendations</h2>
+      <div class="card"><div class="value" style="font-weight:500;font-size:14px;line-height:1.6">${narrativeHtml}</div></div>
+      ` : ''}
+    </div>
+  </body>
+  </html>`;
+}
+
+// -------------------- Report Generation --------------------
+
+function buildKeywordCompetitorBlock(rows: RankingRow[]): string {
+  const header = ['Keyword','My Rank','Competitor','Competitor Rank','Comp. Reviews','Comp. Avg Rating','Comp. Website','Comp. Call','Comp. Schedule','Comp. Description'];
+  const lines = [header.join(' | '), header.map(()=>'---').join(' | ')];
+  for (const r of rows) {
+    const d = r.competitorDetails || ({} as any);
+    const compDesc = d.description || d.about || '';
+    lines.push([
+      r.keyword,
+      r.yourRanking,
+      r.topCompetitor,
+      r.theirRank,
+      d.reviews || 'N/A',
+      d.averageRating || d.rating || 'N/A',
+      d.website || 'N/A',
+      d.callAvailable ? 'Yes' : (d.callBtn ? 'Yes' : 'No'),
+      d.scheduleAvailable ? 'Yes' : (d.scheduleBtn ? 'Yes' : 'No'),
+      compDesc.replace(/\n+/g,' ').slice(0,180)
+    ].join(' | '));
+  }
+  return lines.join('\n');
+}
+
+function buildGmbReportPrompt(biz: MyBizDetails, rows: RankingRow[]): string {
+  const keywordTable = buildKeywordCompetitorBlock(rows);
+  const template = `You are a GMB (Google My Business) report analyst.  
+Using the provided GMB profile data and competitor keyword analysis, generate a detailed GMB report in the format of “Sreesurya Ayurveda.html” (HTML structure with headings, tables, and descriptive sections).  
+
+### Base Profile Data
+Profile Title: {{profile_title}}  
+Description: {{profile_description}}  
+Number of GMB Posts: {{num_posts}}  
+Total Reviews: {{total_reviews}}  
+Website: {{website_status}}  
+Directions: {{directions_status}}  
+Call Button: {{call_button_status}}  
+Schedule Now Button: {{schedule_button_status}}  
+Average Rating: {{avg_rating}}  
+
+### Keyword & Competitor Data
+For each keyword below, provide:  
+- Current Ranking of Base Profile  
+- Top Competitor (Name, Website, Description)  
+- Competitor Ranking  
+- Competitor Reviews, Avg Rating, Content Count, Buttons (Call/Schedule)  
+- Gap Analysis vs Base Profile  
+
+{{keyword_competitor_table}}
+
+### Output Format
+- Write the report in **descriptive HTML format**.  
+- Include sections:  
+  - Profile Overview  
+  - Keyword Performance & Competitor Analysis (tables + descriptive narrative)  
+  - Key Insights & Recommendations (SEO, reviews, USP positioning, website fixes, etc.)  
+  - Final Summary of Growth Potential.  
+
+Make it professional, analytical, and visually structured for a client-facing report.`;
+
+  const descParts = [biz.category, biz.address].filter(Boolean).join(' | ');
+  return template
+    .replace('{{profile_title}}', biz.name || 'N/A')
+    .replace('{{profile_description}}', descParts || 'N/A')
+    .replace('{{num_posts}}', biz.posts || '0')
+    .replace('{{total_reviews}}', biz.reviewCount || '0')
+    .replace('{{website_status}}', biz.website ? 'Yes' : 'No')
+    .replace('{{directions_status}}', biz.hasDirections ? 'Yes' : 'No')
+    .replace('{{call_button_status}}', biz.callAvailable ? 'Yes' : 'No')
+    .replace('{{schedule_button_status}}', biz.scheduleAvailable ? 'Yes' : 'No')
+    .replace('{{avg_rating}}', biz.averageRating || 'N/A')
+    .replace('{{keyword_competitor_table}}', keywordTable);
+}
+
+// Build a short narrative prompt for AI to return only HTML paragraphs and bullet lists (no full HTML shell)
+function buildNarrativePrompt(biz: MyBizDetails, rows: RankingRow[], city: string): string {
+  const summary = {
+    name: biz.name,
+    city,
+    posts: biz.posts,
+    reviews: biz.reviewCount,
+    avgRating: biz.averageRating,
+    website: !!biz.website,
+    directions: !!biz.hasDirections,
+    call: !!biz.callAvailable,
+    schedule: !!biz.scheduleAvailable,
+  };
+  const compactRows = rows.map(r => ({
+    keyword: r.keyword,
+    yourRank: r.yourRanking,
+    competitor: r.topCompetitor,
+    compRank: r.theirRank,
+    compReviews: (r.competitorDetails?.reviews || r.reviews || ''),
+    compRating: (r.competitorDetails?.rating || r.rating || ''),
+  }));
+  return `You are a GMB analyst. Using the JSON below, write a concise, client-facing narrative in HTML fragment form (no <html> or <body>). Include:
+  - Profile overview in 2-3 short paragraphs.
+  - Key findings from keyword rankings and competitor benchmarking.
+  - 6-10 specific recommendations (bulleted) covering SEO, reviews, content, website fixes, GMB buttons, and positioning.
+  Keep it professional and clear.
+
+  Base Profile Summary JSON: ${JSON.stringify(summary)}
+  Keyword Rows JSON: ${JSON.stringify(compactRows)}
+`;
+}
+
+async function saveHtmlAndMaybePdf(html: string, profileTitle: string, wantPdf: boolean) {
+  const reportsDir = path.resolve(process.cwd(), 'reports');
+  const pdfDir = path.join(reportsDir, 'pdf');
+  try { fs.mkdirSync(reportsDir, { recursive: true }); } catch {}
+  if (wantPdf) { try { fs.mkdirSync(pdfDir, { recursive: true }); } catch {} }
+
+  const safe = (profileTitle || 'Profile').replace(/[^a-z0-9-_]+/gi, '_').slice(0, 80);
+  const htmlPath = path.join(reportsDir, `GMB_Report_${safe}.html`);
+  fs.writeFileSync(htmlPath, html, 'utf-8');
+  console.log(`\nSaved HTML report: ${htmlPath}`);
+
+  if (!wantPdf) return;
+  const pdfPath = path.join(pdfDir, `GMB_Report_${safe}.pdf`);
+
+  const tryExec = (bin: string, args: string[]) => new Promise<void>((resolve, reject) => {
+    execFile(bin, args, (err) => err ? reject(err) : resolve());
+  });
+
+  try {
+    await tryExec('wkhtmltopdf', [htmlPath, pdfPath]);
+    console.log(`Saved PDF report (wkhtmltopdf): ${pdfPath}`);
+  } catch {
+    try {
+      await tryExec('weasyprint', [htmlPath, pdfPath]);
+      console.log(`Saved PDF report (weasyprint): ${pdfPath}`);
+    } catch (e) {
+      console.warn('Failed to render PDF via wkhtmltopdf/weasyprint. HTML saved. Install one of these to enable PDF export.');
+    }
+  }
+}
+
 // Fetch my business details by searching Google (RHS panel), not opening Maps directly
-async function fetchMyBusinessDetailsFromGoogle(business: string, city: string) {
+type MyBizDetails = {
+  name: string;
+  averageRating: string;
+  reviewCount: string;
+  category: string;
+  address: string;
+  phone: string;
+  website: string;
+  websiteBtn: string;
+  scheduleAvailable: boolean;
+  callAvailable: boolean;
+  hasDirections: boolean;
+  posts: string;
+};
+
+async function fetchMyBusinessDetailsFromGoogle(business: string, city: string): Promise<MyBizDetails | null> {
   const query = `${business} ${city}`.trim();
   const userDataDir = process.env.USER_DATA_DIR || path.resolve(process.cwd(), '.puppeteer_profile');
   try { fs.mkdirSync(userDataDir, { recursive: true }); } catch {}
@@ -67,6 +400,20 @@ async function fetchMyBusinessDetailsFromGoogle(business: string, city: string) 
 
     // Wait a bit for RHS action buttons (Website/Directions/Reviews) to render
     try {
+      // If CAPTCHA is present, allow the user time to solve it manually
+      const hasCaptcha = await page.$('iframe[src*="recaptcha"], iframe[src*="captcha"], #captcha, .g-recaptcha');
+      if (hasCaptcha) {
+        console.warn('\nCAPTCHA detected on Google search. Please complete the verification in the browser window.');
+        console.warn('The scraper will wait up to 180s for verification to complete...');
+        try { await page.bringToFront(); } catch {}
+        try {
+          await page.waitForFunction(() => {
+            const cap = document.querySelector('iframe[src*="recaptcha"], iframe[src*="captcha"], #captcha, .g-recaptcha');
+            const rhs = document.querySelector('#rhs');
+            return !cap && !!rhs;
+          }, { timeout: 180000 });
+        } catch {}
+      }
       await page.waitForFunction(() => {
         const scope: Document | Element = document;
         const cand = Array.from(scope.querySelectorAll('#rhs a, #rhs button, #rhs [role="link"], a, button, [role="link"]')) as HTMLElement[];
@@ -146,8 +493,14 @@ async function fetchMyBusinessDetailsFromGoogle(business: string, city: string) 
         }
       }
       out.hasDirections = !!dirEl;
-      // Schedule button (appointment)
-      const schedEl = root.querySelector('a[aria-label*="Schedule" i], a[data-attrid*="appointment" i], a[aria-label*="Book"]') as HTMLElement | null;
+      // Schedule button (appointment/book/reserve)
+      let schedEl = root.querySelector('a[aria-label*="Schedule" i], a[data-attrid*="appointment" i], a[aria-label*="Book" i], a[data-attrid*="reserve" i], a[data-attrid*="booking" i]') as HTMLElement | null;
+      if (!schedEl) {
+        const sSpan = Array.from(root.querySelectorAll('span.PbOY2e')).find(sp => /\bbook\b|\bbook online\b|\bappointment\b|\breserve\b|\bbooking\b/i.test(sp.textContent || '')) as HTMLElement | undefined;
+        if (sSpan) {
+          schedEl = (sSpan.closest('[role="link"], a, button') as HTMLElement) || null;
+        }
+      }
       out.scheduleAvailable = !!schedEl;
       out.scheduleBtn = out.scheduleAvailable ? 'Yes' : 'No';
       // Call button
@@ -175,8 +528,23 @@ async function fetchMyBusinessDetailsFromGoogle(business: string, city: string) 
     console.log(`- Call: ${(rhs?.callAvailable ? 'Yes' : 'No')}`);
     console.log(`- Directions: ${(rhs?.hasDirections ? 'Yes' : 'No')}`);
     console.log(`- Posts: ${clean(rhs?.posts || '0')}`);
+    return {
+      name: clean(rhs?.name || business),
+      averageRating: clean(rhs?.averageRating),
+      reviewCount: clean(rhs?.reviewCount),
+      category: clean(rhs?.category),
+      address: clean(rhs?.address),
+      phone: clean(rhs?.phone),
+      website: clean(rhs?.website),
+      websiteBtn: rhs?.website ? 'Yes' : 'No',
+      scheduleAvailable: !!rhs?.scheduleAvailable,
+      callAvailable: !!rhs?.callAvailable,
+      hasDirections: !!rhs?.hasDirections,
+      posts: clean(rhs?.posts || '0'),
+    } as MyBizDetails;
   } catch (e) {
     console.warn('Failed to fetch my business details from Google:', (e as Error).message);
+    return null;
   } finally {
     try { await page.close(); } catch {}
     try { await browser.close(); } catch {}
@@ -411,7 +779,7 @@ export interface RankingRow {
 }
 
 // === Args parser ===
-function parseArgs(): { gmbUrl?: string } {
+function parseArgs(): { gmbUrl?: string; pdf?: boolean } {
   const args = process.argv.slice(2);
   const out: Record<string, string | boolean> = {};
   for (let i = 0; i < args.length; i++) {
@@ -423,7 +791,7 @@ function parseArgs(): { gmbUrl?: string } {
       else out[key.replace(/^--/, '')] = true;
     }
   }
-  return out as { gmbUrl?: string };
+  return out as { gmbUrl?: string; pdf?: boolean };
 }
 
 // Helper function for random delays between actions with human-like variation
@@ -2613,7 +2981,7 @@ async function main() {
   keywords.forEach((k, i) => console.log(`  ${i + 1}. ${k.keyword} -> ${k.query}`));
 
   // Fetch and display my business details from Google RHS based on detected business & city
-  await fetchMyBusinessDetailsFromGoogle(business, city);
+  const myDetails = await fetchMyBusinessDetailsFromGoogle(business, city);
 
   console.log('\nGenerating rankings...');
   const rankings = await generateScrapedRankings(keywords, business, city);
@@ -2624,6 +2992,41 @@ async function main() {
   // Print the detailed competitor analysis table
   if (rankings.length > 0) {
     printCompetitorTable(rankings);
+  }
+
+  // Build GMB report prompt and generate report via Gemini
+  const detailsForPrompt = myDetails || {
+    name: business,
+    averageRating: 'N/A',
+    reviewCount: '0',
+    category: '',
+    address: '',
+    phone: '',
+    website: '',
+    websiteBtn: 'No',
+    scheduleAvailable: false,
+    callAvailable: false,
+    hasDirections: false,
+    posts: '0'
+  } as MyBizDetails;
+
+  try {
+    // Preferred: build our own styled HTML to match the required format (header + snapshot + two tables)
+    let narrativeHtml: string | undefined;
+    try {
+      const nPrompt = buildNarrativePrompt(detailsForPrompt, rankings, city);
+      narrativeHtml = String(await getAiGeneratedText(nPrompt) || '').trim();
+    } catch {}
+    const styledHtml = buildStyledHtmlReport(detailsForPrompt, rankings, city, narrativeHtml);
+    await saveHtmlAndMaybePdf(styledHtml, detailsForPrompt.name || business, Boolean(args.pdf));
+    // Optional: enable AI-generated HTML via env flag USE_AI_PROMPT=1
+    if (process.env.USE_AI_PROMPT === '1') {
+      const prompt = buildGmbReportPrompt(detailsForPrompt, rankings);
+      const html = await getAiGeneratedText(prompt);
+      await saveHtmlAndMaybePdf(String(html || ''), `${detailsForPrompt.name || business}_AI`, Boolean(args.pdf));
+    }
+  } catch (e) {
+    console.warn('Failed to generate/save GMB report:', (e as Error).message);
   }
 
   // Save to file if needed
