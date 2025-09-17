@@ -1,0 +1,2482 @@
+// gmbrankingscrapping.ts
+/**
+ * Full modified script (TypeScript) with more robust extraction for Google Search local-pack
+ * and Google Maps place page scraping.
+ *
+ * Install required packages:
+ * pnpm add puppeteer-extra puppeteer-extra-plugin-stealth puppeteer @types/node
+ *
+ * Important:
+ * - Stealth reduces, but does not guarantee elimination of CAPTCHAs.
+ * - If you still face CAPTCHAs frequently consider rotating residential proxies,
+ *   slower pacing, or human/CAPTCHA solving fallbacks (not included here).
+ */
+
+import dotenv from 'dotenv';
+dotenv.config({ path: '.env.dev' });
+dotenv.config({ path: '.env' });
+
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { Browser, Page, LaunchOptions, ElementHandle } from 'puppeteer';
+import fs from 'fs';
+import path from 'path';
+import getAiGeneratedText from '../services/generativeAI';
+
+// Enable stealth plugin
+puppeteer.use(StealthPlugin());
+
+export interface KeywordIdea {
+  keyword: string;
+  query: string;
+}
+
+let __hasWarmedUp = false;
+
+// Type text like a person
+async function typeLikeHuman(page: Page, selector: string, text: string) {
+  // Slight idle before interacting
+  await new Promise(r => setTimeout(r, 300 + Math.floor(Math.random() * 500)));
+  // Prefer clicking the box like a user
+  const el = await page.$(selector);
+  if (el) {
+    try {
+      const box = await el.boundingBox();
+      if (box) {
+        await page.mouse.move(
+          box.x + box.width * (0.3 + Math.random() * 0.4),
+          box.y + box.height * (0.5 + Math.random() * 0.2),
+          { steps: 8 }
+        );
+        await new Promise(r => setTimeout(r, 150 + Math.floor(Math.random() * 250)));
+        await page.mouse.click(
+          box.x + box.width * (0.3 + Math.random() * 0.4),
+          box.y + box.height * (0.5 + Math.random() * 0.2),
+          { delay: 50 + Math.floor(Math.random() * 80) }
+        );
+      }
+    } catch {}
+  }
+  // Fallback focus
+  try { await page.focus(selector); } catch {}
+  // Type with slower, varied delays
+  for (const ch of text.split('')) {
+    await page.type(selector, ch, { delay: 95 + Math.floor(Math.random() * 140) });
+    if (Math.random() < 0.18) {
+      await new Promise(r => setTimeout(r, 200 + Math.floor(Math.random() * 400)));
+    }
+  }
+}
+
+// Accept Google's consent dialog if present (top-level and inside consent iframes)
+async function acceptGoogleConsent(page: Page) {
+  const tryClick = async (ctx: Page | import('puppeteer').Frame) => {
+    const selectors = [
+      'button:has-text("I agree")',
+      'button:has-text("Accept all")',
+      'button:has-text("Accept")',
+      '#L2AGLb',
+      '[aria-label*="Accept" i]'
+    ];
+    for (const sel of selectors) {
+      try {
+        const btn = await (ctx as any).$(sel);
+        if (btn) {
+          if ('mouse' in ctx) {
+            await humanMoveMouse(ctx as Page, sel);
+          }
+          await btn.click();
+          await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 1200)));
+          return true;
+        }
+      } catch {}
+    }
+    return false;
+  };
+
+  // 1) Try in main page
+  if (await tryClick(page)) return;
+
+  // 2) Try in consent frames
+  for (const f of page.frames()) {
+    const url = f.url() || '';
+    if (url.includes('consent.') || url.includes('consent.google') || url.includes('privacy')) {
+      if (await tryClick(f)) return;
+    }
+  }
+}
+
+// Find the Google search box selector across variants
+async function findSearchBoxSelector(page: Page): Promise<string | null> {
+  const candidates = [
+    'input[name="q"]',
+    'textarea[name="q"]',
+    'input#APjFqb',
+    'input.gLFyf',
+    'textarea.gLFyf',
+    'input[aria-label="Search"]',
+    'textarea[aria-label="Search"]'
+  ];
+  // Wait briefly for any candidate to appear
+  try {
+    await page.waitForFunction((sels: string[]) => sels.some(s => !!document.querySelector(s)), { timeout: 8000 }, candidates);
+  } catch {}
+  for (const sel of candidates) {
+    const exists = await page.$(sel);
+    if (exists) return sel;
+  }
+  return null;
+}
+
+// Navigate to Google home and perform a search like a real user
+async function performHumanSearch(page: Page, query: string): Promise<boolean> {
+  const ok = await safeGoto(page, 'https://www.google.com/?hl=en');
+  if (!ok) return false;
+  await acceptGoogleConsent(page);
+
+  // One-time warm-up to reduce first-query CAPTCHA
+  if (!__hasWarmedUp) {
+    try {
+      // small random idle
+      await new Promise(r => setTimeout(r, 1200 + Math.floor(Math.random() * 1600)));
+      // hop to images then back
+      await safeGoto(page, 'https://www.google.com/imghp?hl=en');
+      await acceptGoogleConsent(page);
+      await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 1200)));
+      await safeGoto(page, 'https://www.google.com/?hl=en');
+      await acceptGoogleConsent(page);
+      // explore a bit
+      await explorePageHuman(page);
+    } catch {}
+    __hasWarmedUp = true;
+  }
+  const sel = await findSearchBoxSelector(page);
+  if (!sel) {
+    // Fallback: try to open webhp which often ensures the classic input
+    await safeGoto(page, 'https://www.google.com/webhp?hl=en&source=hp');
+    await acceptGoogleConsent(page);
+    const fallbackSel = await findSearchBoxSelector(page);
+    if (!fallbackSel) return false;
+    await typeLikeHuman(page, fallbackSel, query);
+  } else {
+    await typeLikeHuman(page, sel, query);
+  }
+  // Idle before submitting
+  await new Promise(r => setTimeout(r, 600 + Math.floor(Math.random() * 900)));
+  await page.keyboard.press('Enter');
+  try {
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 });
+  } catch {}
+  // A bit of human-like scroll
+  try { await page.evaluate(() => window.scrollBy(0, Math.floor(Math.random() * 400) + 200)); } catch {}
+  await randomDelay(800, 1600);
+  return true;
+}
+
+// Briefly explore the page like a human (mouse move + small scrolls)
+async function explorePageHuman(page: Page) {
+  try {
+    // Random small scrolls
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(() => window.scrollBy(0, Math.floor(Math.random() * 350) + 120));
+      await new Promise(r => setTimeout(r, 300 + Math.floor(Math.random() * 600)));
+    }
+    // Small mouse wiggle
+    const vw = await page.viewport();
+    const x = 100 + Math.floor(Math.random() * Math.max(200, (vw?.width || 800) / 3));
+    const y = 200 + Math.floor(Math.random() * Math.max(200, (vw?.height || 600) / 3));
+    await page.mouse.move(x, y, { steps: 12 });
+    await new Promise(r => setTimeout(r, 400 + Math.floor(Math.random() * 700)));
+  } catch {}
+}
+
+// Stealth-only CAPTCHA mitigation: backoff and retry navigation
+async function mitigateCaptcha(page: Page, targetUrl: string, attempts = 2): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    const captcha = await page.$('iframe[src*="recaptcha"], iframe[src*="captcha"], #captcha, .g-recaptcha');
+    if (!captcha) return; // no captcha, proceed
+
+    const delay = 15000 + Math.floor(Math.random() * 20000); // 15-35s
+    console.warn(`CAPTCHA detected (attempt ${i + 1}/${attempts}). Backing off for ${Math.round(delay/1000)}s...`);
+    await new Promise(r => setTimeout(r, delay));
+
+    // Light human-like motions to reduce suspicion
+    try { await page.evaluate(() => window.scrollBy(0, Math.floor(Math.random() * 400) + 200)); } catch {}
+    await new Promise(r => setTimeout(r, 1000 + Math.floor(Math.random() * 1500)));
+
+    // Retry navigation to the same search URL
+    try {
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    } catch {}
+  }
+}
+
+function isCaptchaInterstitial(url: string, htmlSnippet: string): boolean {
+  const u = url || '';
+  if (u.includes('/sorry/') || u.includes('/interstitial') || u.includes('sorry/index')) return true;
+  const h = (htmlSnippet || '').toLowerCase();
+  return h.includes('unusual traffic') || h.includes("i'm not a robot") || h.includes('recaptcha');
+}
+
+export interface CompetitorDetails {
+  rating: string;
+  reviews: string;
+  category: string;
+  address: string;
+  phone: string;
+  website: string;
+  mapsUrl: string;
+  hours?: string;
+  about?: string;
+  services?: string[];
+  description?: string;
+  posts?: string;
+  scheduleAvailable?: boolean;
+  callAvailable?: boolean;
+  hasDirections?: boolean;
+  reviewCount?: string;
+  averageRating?: string;
+  websiteBtn?: string;
+  scheduleBtn?: string;
+  callBtn?: string;
+  [key: string]: any; // Add index signature to allow dynamic properties
+}
+
+export interface RankingRow {
+  keyword: string;
+  yourRanking: string;
+  topCompetitor: string;
+  theirRank: string;
+  competitorDetails: CompetitorDetails;
+  rating: string;
+  reviews: string;
+  category: string;
+  address: string;
+  phone: string;
+  website: string;
+  mapsUrl: string;
+  lastUpdated?: string;
+}
+
+// === Args parser ===
+function parseArgs(): { gmbUrl?: string } {
+  const args = process.argv.slice(2);
+  const out: Record<string, string | boolean> = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--')) {
+      const [key, val] = a.split('=');
+      if (val !== undefined) out[key.replace(/^--/, '')] = val;
+      else if (i + 1 < args.length && !args[i + 1].startsWith('--')) out[key.replace(/^--/, '')] = args[++i];
+      else out[key.replace(/^--/, '')] = true;
+    }
+  }
+  return out as { gmbUrl?: string };
+}
+
+// Helper function for random delays between actions with human-like variation
+const randomDelay = (min: number, max: number) => {
+  const baseDelay = Math.floor(Math.random() * (max - min + 1) + min);
+  const jitter = Math.random() * 0.3 * baseDelay - (0.15 * baseDelay);
+  return new Promise((resolve) => setTimeout(resolve, Math.max(400, baseDelay + jitter)));
+};
+
+// --- Robust Local Finder scrolling & detection helper ---
+// Assumptions: page and lfPage (popup page) may exist; sigTokens is an array of normalized tokens; corePrefixNorm is normalized core prefix.
+async function scanLocalFinderForBusiness({
+  page,
+  lfPage,
+  sigTokens,
+  corePrefixNorm,
+  maxScrolls = 12,
+  scrollDelayMin = 800,
+  scrollDelayMax = 1400,
+}: {
+  page: any;
+  lfPage: any;
+  sigTokens: string[];
+  corePrefixNorm: string;
+  maxScrolls?: number;
+  scrollDelayMin?: number;
+  scrollDelayMax?: number;
+}) {
+  const finderPage = (lfPage && !lfPage.isClosed && !lfPage.isClosed()) ? lfPage : page;
+  try { await finderPage.bringToFront?.(); } catch {}
+  // Guard: if core prefix is too short or missing, do not risk false positives
+  if (!corePrefixNorm || corePrefixNorm.length < 4) {
+    try { console.log('[Local Finder] Debug: corePrefixNorm missing/short, refusing to match to avoid false positives'); } catch {}
+    return { foundIndex: -1, foundTitle: null };
+  }
+
+  const checkScript = (sigTokensArg: string[], corePrefix: string) => {
+    const norm = (s: any) => (s || '').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const tokenize = (s: string) => (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+    const busSet = new Set<string>(sigTokensArg.map(norm));
+    const cardSelectors = ['.Nv2PK', '.Nv2PK.tH5CWc', '.hfpxzc', '[role="article"] .qBF1Pd', '.dbg0pd', '.OSrXXb', '.Nr22bf'];
+    let cards: HTMLElement[] = [];
+    for (const sel of cardSelectors) {
+      cards = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+      if (cards.length) break;
+    }
+    if (cards.length === 0) {
+      const arts = Array.from(document.querySelectorAll('div[role="feed"] [role="article"], [data-result-index]')) as HTMLElement[];
+      cards = arts.filter(a => a.textContent && a.textContent.trim().length > 5);
+    }
+    cards = cards.filter(c => !(/sponsored|\bad\b/i.test(c.textContent || '')));
+    const titles: string[] = cards.map(c => {
+      const link = c.querySelector('a[aria-label], a.hfpxzc, a') as HTMLElement | null;
+      let t = '';
+      if (link) {
+        t = (link.getAttribute && (link.getAttribute('aria-label') || link.getAttribute('title'))) || '';
+      }
+      if (!t) t = (c.getAttribute && c.getAttribute('aria-label')) || '';
+      if (!t) t = c.textContent || '';
+      return (t || '').trim();
+    });
+    // Compute how common the core prefix is and rarity of our tokens
+    const norms = titles.map(t => t.toLowerCase().replace(/[^a-z0-9]/g, ''));
+    const coreCount = norms.reduce((acc, n) => acc + (corePrefix && corePrefix.length >= 4 && n.includes(corePrefix) ? 1 : 0), 0);
+    const freq = new Map<string, number>();
+    for (const t of titles) {
+      const ws = new Set(tokenize(t));
+      for (const w of ws) freq.set(w, (freq.get(w) || 0) + 1);
+    }
+    const rareSet = new Set<string>();
+    for (const tk of busSet) {
+      if (tk.length < 5) continue; // prefer longer distinctive tokens
+      const f = freq.get(tk) || 0;
+      if (f <= 2) rareSet.add(tk);
+    }
+    const needsRare = coreCount >= 3; // if core appears on many titles, require a rare token too
+
+    for (let i = 0; i < norms.length; i++) {
+      const n = norms[i];
+      const coreHit = !!corePrefix && corePrefix.length >= 4 && n.includes(corePrefix);
+      if (!coreHit) continue;
+      if (needsRare) {
+        let rareHits = 0; for (const tk of rareSet) if (n.includes(tk)) { rareHits++; break; }
+        if (rareHits === 0) continue;
+      }
+      return { foundIndex: i + 1, title: titles[i] || null };
+    }
+    return { foundIndex: -1, title: null };
+  };
+
+  let lastCount = -1;
+  let stable = 0;
+  for (let attempt = 0; attempt < maxScrolls; attempt++) {
+    const res = await finderPage.evaluate(checkScript, sigTokens, corePrefixNorm);
+    if (res && res.foundIndex && res.foundIndex > 0) {
+      // Click candidate and verify RHS title contains corePrefixNorm
+      try {
+        await finderPage.evaluate((idx: number) => {
+          let cards = Array.from(document.querySelectorAll('.Nv2PK')) as HTMLElement[];
+          if (cards.length === 0) {
+            const arts = Array.from(document.querySelectorAll('div[role="feed"] [role="article"], div[aria-label*="Results for"] [role="article"]')) as HTMLElement[];
+            cards = arts.filter(a => a.textContent && a.textContent.trim().length > 5) as HTMLElement[];
+          }
+          cards = cards.filter(c => !(/sponsored|\bad\b/i.test(c.textContent || '')));
+          (cards[idx - 1] as HTMLElement)?.scrollIntoView({ behavior: 'auto', block: 'center' });
+          (cards[idx - 1] as HTMLElement)?.click();
+        }, res.foundIndex as number);
+        try { await finderPage.waitForSelector('[role="main"] h1, .DUwDvf, [data-attrid="title"]', { timeout: 6000 }); } catch {}
+        await new Promise(r => setTimeout(r, 700));
+        const rhsName = await finderPage.evaluate(() => (document.querySelector('[role="main"] h1, .DUwDvf, [data-attrid="title"]')?.textContent || '').trim());
+        const nameNorm = (rhsName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (corePrefixNorm && corePrefixNorm.length >= 4 && nameNorm.includes(corePrefixNorm)) {
+          return { foundIndex: res.foundIndex, foundTitle: res.title };
+        }
+      } catch {}
+      // verification failed; continue scanning
+    }
+
+    // capture signature before scroll (count + last title)
+    const beforeSig = await finderPage.evaluate(() => {
+      const titles = Array.from(document.querySelectorAll('.Nv2PK .qBF1Pd, .Nv2PK .OSrXXb, [role="article"] .qBF1Pd, [role="article"] h3'))
+        .map(e => (e.textContent||'').trim()).filter(Boolean);
+      return { count: titles.length, last: titles[titles.length-1] || '' };
+    });
+
+    await finderPage.evaluate(() => {
+      const candidates = [
+        'div[role="feed"]',
+        'div[aria-label*="Results for" i] .m6QEr',
+        '.DxyBCb .m6QEr',
+        '.m6QEr',
+        '.m6QEr .section-scrollbox',
+        '.section-scrollbox'
+      ];
+      // Try explicit scrollable element discovery
+      const findScrollableAncestor = (el: HTMLElement | null): HTMLElement | null => {
+        let p: HTMLElement | null = el;
+        for (let i = 0; i < 8 && p; i++) {
+          const cs = window.getComputedStyle(p);
+          if ((/auto|scroll/.test(cs.overflowY || '')) && p.scrollHeight > p.clientHeight) return p;
+          p = p.parentElement as HTMLElement | null;
+        }
+        return null;
+      };
+      let panel: HTMLElement | null = null;
+      const feed = document.querySelector('div[role="feed"]') as HTMLElement | null;
+      if (feed) panel = findScrollableAncestor(feed) || feed;
+      if (!panel) {
+        const firstCard = (document.querySelector('.Nv2PK') || document.querySelector('[role="article"]')) as HTMLElement | null;
+        panel = findScrollableAncestor(firstCard as HTMLElement | null);
+      }
+      if (!panel) {
+        for (const sel of candidates) {
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (!el) continue;
+          const cs = window.getComputedStyle(el);
+          const ok = (el.scrollHeight > el.clientHeight) && (/auto|scroll/.test(cs.overflowY || '') || (el as any).scrollTop !== undefined);
+          if (ok) { panel = el; break; }
+        }
+      }
+      if (panel) {
+        try {
+          (panel as any).focus?.();
+          const step = Math.max(400, Math.floor(panel.clientHeight * 0.95));
+          panel.scrollBy(0, step);
+          panel.dispatchEvent(new WheelEvent('wheel', { deltaY: step }));
+          // hard jump towards bottom as a fallback
+          panel.scrollTop = Math.min(panel.scrollTop + step * 2, panel.scrollHeight);
+          return { ok: true };
+        } catch (e) {}
+      }
+      try { window.scrollBy(0, Math.max(600, window.innerHeight / 2)); return { ok: true, selUsed: 'window' }; } catch (e) {}
+      return { ok: false };
+    });
+    // Nudge lazy-load by focusing feed and pressing PageDown
+    try {
+      await finderPage.evaluate(() => { (document.querySelector('div[role="feed"]') as HTMLElement)?.click(); });
+      for (let i = 0; i < 4; i++) { await (finderPage as any).keyboard.press('End'); await (finderPage as any).keyboard.press('PageDown'); }
+    } catch {}
+
+    const waitMs = Math.floor(Math.random() * (scrollDelayMax - scrollDelayMin + 1)) + scrollDelayMin;
+    await new Promise(r => setTimeout(r, waitMs));
+
+    // wait for last-title signature to change (indicates new items loaded)
+    try {
+      await finderPage.waitForFunction((prev: any) => {
+        const titles = Array.from(document.querySelectorAll('.Nv2PK .qBF1Pd, .Nv2PK .OSrXXb, [role="article"] .qBF1Pd, [role="article"] h3'))
+          .map(e => (e.textContent||'').trim()).filter(Boolean);
+        const sig = { count: titles.length, last: titles[titles.length-1] || '' } as any;
+        return sig.count > (prev as any).count || sig.last !== (prev as any).last;
+      }, { timeout: 4000 }, beforeSig);
+    } catch {}
+
+    const after = await finderPage.evaluate(checkScript, sigTokens, corePrefixNorm);
+    if (after && after.foundIndex && after.foundIndex > 0) {
+      try {
+        await finderPage.evaluate((idx: number) => {
+          let cards = Array.from(document.querySelectorAll('.Nv2PK')) as HTMLElement[];
+          if (cards.length === 0) {
+            const arts = Array.from(document.querySelectorAll('div[role="feed"] [role="article"], div[aria-label*="Results for"] [role="article"]')) as HTMLElement[];
+            cards = arts.filter(a => a.textContent && a.textContent.trim().length > 5) as HTMLElement[];
+          }
+          cards = cards.filter(c => !(/sponsored|\bad\b/i.test(c.textContent || '')));
+          (cards[idx - 1] as HTMLElement)?.scrollIntoView({ behavior: 'auto', block: 'center' });
+          (cards[idx - 1] as HTMLElement)?.click();
+        }, after.foundIndex as number);
+        try { await finderPage.waitForSelector('[role=\"main\"] h1, .DUwDvf, [data-attrid=\"title\"]', { timeout: 6000 }); } catch {}
+        await new Promise(r => setTimeout(r, 700));
+        const rhsName2 = await finderPage.evaluate(() => (document.querySelector('[role="main"] h1, .DUwDvf, [data-attrid="title"]')?.textContent || '').trim());
+        const nameNorm2 = (rhsName2 || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (corePrefixNorm && corePrefixNorm.length >= 4 && nameNorm2.includes(corePrefixNorm)) {
+          return { foundIndex: after.foundIndex, foundTitle: after.title };
+        }
+      } catch {}
+    }
+
+    const countNow = await finderPage.evaluate(() => {
+      const selCands = ['.Nv2PK', 'div[role="feed"] [role="article"]', '.dbg0pd'];
+      for (const s of selCands) {
+        const nodes = document.querySelectorAll(s);
+        if (nodes && nodes.length) return nodes.length;
+      }
+      return document.querySelectorAll('div[role="feed"] [role="article"]').length;
+    });
+    try { console.log('[Local Finder] Debug: cards loaded =', countNow); } catch {}
+    if (countNow === lastCount) stable++; else stable = 0;
+    lastCount = countNow as any;
+    if (stable >= 3) break;
+  }
+
+  // Debug: print current page visible titles for verification
+  try {
+    const dbg = await finderPage.evaluate(() => {
+      const cardSelectors = ['.Nv2PK', '.Nv2PK.tH5CWc', '.hfpxzc', '[role="article"] .qBF1Pd', '.dbg0pd', '.OSrXXb', '.Nr22bf'];
+      let cards: HTMLElement[] = [];
+      for (const sel of cardSelectors) {
+        const found = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+        if (found.length) { cards = found.map(n => (sel.includes(' .') ? (n.closest('.Nv2PK') as HTMLElement) || n : n)); break; }
+      }
+      if (cards.length === 0) {
+        const feed = document.querySelector('div[role="feed"]') as HTMLElement | null;
+        const arts = Array.from(document.querySelectorAll('div[role="feed"] [role="article"], [data-result-index]')) as HTMLElement[];
+        const anchors = feed ? Array.from(feed.querySelectorAll('a[aria-label], a.hfpxzc')) as HTMLElement[] : [];
+        cards = arts.filter(a => a.textContent && a.textContent.trim().length > 5);
+        if (cards.length === 0 && anchors.length) {
+          // Build pseudo-cards from anchors so we can extract titles
+          cards = anchors.map(a => (a.closest('.Nv2PK') as HTMLElement) || a);
+        }
+      }
+      cards = cards.filter(c => !(/sponsored|\bad\b/i.test(c.textContent || '')));
+      const getTitle = (c: HTMLElement): string => {
+        const link = c.querySelector('a[aria-label], a.hfpxzc, a') as HTMLElement | null;
+        let t = '';
+        if (link) { t = (link.getAttribute && (link.getAttribute('aria-label') || link.getAttribute('title'))) || ''; }
+        if (!t) t = (c.getAttribute && c.getAttribute('aria-label')) || '';
+        if (!t) t = c.textContent || '';
+        return (t || '').trim();
+      };
+      return cards.slice(0, 30).map((c, i) => `${i + 1}. ${getTitle(c)}`);
+    });
+    console.log('[Local Finder] Debug: visible titles on current page:', dbg);
+  } catch {}
+
+  const finalRes = await finderPage.evaluate((sigTokensArg: string[], corePrefix: string) => {
+    const norm = (s: any) => (s || '').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const tokenize = (s: string) => (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+    const busSet = new Set(sigTokensArg.map(norm));
+    const cardSelectors = ['.Nv2PK', '.Nv2PK.tH5CWc', '.hfpxzc', '[role="article"] .qBF1Pd', '.dbg0pd', '.OSrXXb', '.Nr22bf'];
+    let cards: HTMLElement[] = [];
+    for (const sel of cardSelectors) {
+      const found = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+      if (found.length) { cards = found.map(n => (sel.includes(' .') ? (n.closest('.Nv2PK') as HTMLElement) || n : n)); break; }
+    }
+    if (cards.length === 0) {
+      const feed = document.querySelector('div[role="feed"]') as HTMLElement | null;
+      const arts = Array.from(document.querySelectorAll('div[role="feed"] [role="article"], [data-result-index]')) as HTMLElement[];
+      const anchors = feed ? Array.from(feed.querySelectorAll('a[aria-label], a.hfpxzc')) as HTMLElement[] : [];
+      cards = arts.filter(a => a.textContent && a.textContent.trim().length > 5);
+      if (cards.length === 0 && anchors.length) {
+        cards = anchors.map(a => (a.closest('.Nv2PK') as HTMLElement) || a);
+      }
+    }
+    cards = cards.filter(c => !(/sponsored|\bad\b/i.test(c.textContent || '')));
+    const getTitle = (c: HTMLElement): string => {
+      const link = c.querySelector('a[aria-label], a.hfpxzc, a') as HTMLElement | null;
+      let t = '';
+      if (link) { t = (link.getAttribute && (link.getAttribute('aria-label') || link.getAttribute('title'))) || ''; }
+      if (!t) t = (c.getAttribute && c.getAttribute('aria-label')) || '';
+      if (!t) t = c.textContent || '';
+      return (t || '').trim();
+    };
+    // Build norms and rarity like in checkScript
+    const titles = cards.map(c => getTitle(c));
+    const norms = titles.map(t => t.toLowerCase().replace(/[^a-z0-9]/g, ''));
+    const coreCount = norms.reduce((acc, n) => acc + (corePrefix && corePrefix.length >= 4 && n.includes(corePrefix) ? 1 : 0), 0);
+    const freq = new Map<string, number>();
+    for (const t of titles) {
+      const ws = new Set(tokenize(t));
+      for (const w of ws) freq.set(w, (freq.get(w) || 0) + 1);
+    }
+    const rareSet = new Set<string>();
+    for (const tk of busSet) {
+      if (tk.length < 5) continue;
+      const f = freq.get(tk) || 0;
+      if (f <= 2) rareSet.add(tk);
+    }
+    const needsRare = coreCount >= 3;
+
+    for (let i = 0; i < norms.length; i++) {
+      const n = norms[i];
+      const coreHit = !!corePrefix && corePrefix.length >= 4 && n.includes(corePrefix);
+      if (!coreHit) continue;
+      if (needsRare) {
+        let rareHits = 0; for (const tk of rareSet) if (n.includes(tk)) { rareHits++; break; }
+        if (rareHits === 0) continue;
+      }
+      return { foundIndex: i + 1, title: titles[i] || null };
+    }
+    return { foundIndex: -1, title: null };
+  }, sigTokens, corePrefixNorm);
+
+  return { foundIndex: finalRes.foundIndex || -1, foundTitle: finalRes.title || null };
+}
+
+
+// -------------------- Utilities --------------------
+async function humanMoveMouse(page: Page, selector: string): Promise<void> {
+  try {
+    const element = await page.$(selector);
+    if (!element) return;
+    const box = await element.boundingBox();
+    if (!box) return;
+    await page.mouse.move(
+      box.x + box.width * (0.2 + Math.random() * 0.6),
+      box.y + box.height * (0.2 + Math.random() * 0.6),
+      { steps: 10 + Math.floor(Math.random() * 10) }
+    );
+    await randomDelay(100, 500);
+  } catch (error) {
+    console.error('Error in humanMoveMouse:', error);
+  }
+}
+
+async function safeGoto(page: Page, url: string, options: any = {}): Promise<boolean> {
+  try {
+    const userAgents = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
+    ];
+    await page.setUserAgent(userAgents[Math.floor(Math.random() * userAgents.length)]);
+
+    await page.setViewport({
+      width: 1200 + Math.floor(Math.random() * 200),
+      height: 800 + Math.floor(Math.random() * 200),
+      deviceScaleFactor: 1,
+      hasTouch: false,
+      isLandscape: false,
+    });
+
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+      'Referer': 'https://www.google.com/',
+      'DNT': '1',
+    });
+
+    await randomDelay(1000, 3000);
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000, ...options });
+    return true;
+  } catch (e) {
+    try {
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000, ...options });
+      return true;
+    } catch (e) {
+      console.error('Failed to navigate to URL:', url, e);
+      return false;
+    }
+  }
+}
+
+// -------------------- Scrapers --------------------
+
+/**
+ * scrapeGoogleSearch
+ * - More robust extraction for both Local Pack and organic results
+ * - Returns an array of objects: { position, title, url, rating, reviews, category, address, description }
+ */
+async function scrapeGoogleSearch(page: Page, query: string, maxResults = 20): Promise<any[]> {
+  await randomDelay(1500, 4000);
+  // Perform the query via google.com homepage to look more organic
+  const ok = await performHumanSearch(page, query);
+  if (!ok) return [];
+
+  // Accept cookie banners if present (best-effort)
+  try {
+    const acceptButtons = [
+      'button:has-text("I agree")',
+      'button:has-text("Accept all")',
+      'button:has-text("Accept")',
+      'button[aria-label*="accept"]',
+      'form button[type="submit"]'
+    ];
+    for (const sel of acceptButtons) {
+      const b = await page.$(sel as any);
+      if (b) {
+        try {
+          await humanMoveMouse(page, sel);
+          await randomDelay(200, 700);
+          await b.click();
+          await randomDelay(800, 1800);
+          break;
+        } catch {}
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  // scroll a bit to allow dynamic content to load
+  for (let i = 0; i < 2; i++) {
+    await page.evaluate(() => window.scrollBy(0, Math.floor(Math.random() * 400) + 200));
+    await randomDelay(500, 1200);
+  }
+
+  // Detect potential captcha and auto-mitigate with backoff+retry (stealth-only)
+  const captchaFrame = await page.$('iframe[src*="recaptcha"], iframe[src*="captcha"], #captcha, .g-recaptcha');
+  if (captchaFrame) {
+    // Retry by re-performing the search like a human instead of loading the query URL
+    await mitigateCaptcha(page, page.url(), 2);
+    await performHumanSearch(page, query);
+  }
+
+  // Brief exploration before parsing results
+  await explorePageHuman(page);
+
+  // Detect Google interstitial (unusual traffic) and apply a longer one-time cooldown then retry
+  try {
+    const snippet = (await page.content()).slice(0, 3000);
+    if (isCaptchaInterstitial(page.url(), snippet)) {
+      console.warn('Detected Google interstitial. Applying long cooldown and retrying once...');
+      await new Promise(r => setTimeout(r, 90000 + Math.floor(Math.random() * 60000))); // 90-150s
+      await performHumanSearch(page, query);
+    }
+  } catch {}
+
+  // Now extract results with multiple fallbacks
+  const results = await page.evaluate((maxResults) => {
+    const out: any[] = [];
+
+    // helper
+    const text = (el: Element | null) => el?.textContent?.trim() || '';
+
+    // 0) Try Knowledge Panel (right-side) when present
+    try {
+      const rhs = document.querySelector('#rhs, .kp-wholepage, .knowledge-panel') || document.querySelector('div[role="complementary"]');
+      if (rhs) {
+        const kp: any = { position: 0 };
+        const getAttr = (el: Element | null, attr: string) => (el && (el as HTMLElement).getAttribute(attr)) || '';
+        const getText = (sel: string) => (rhs.querySelector(sel)?.textContent || '').trim();
+        // Title
+        kp.title = getText('h2, h3, .SPZz6b, .qrShPb, [data-attrid="title"]');
+        // Website button
+        const websiteEl = rhs.querySelector('a[aria-label^="Website" i], a[data-attrid*="website"], a[role="button"][href*="/url?"]');
+        let websiteHref = getAttr(websiteEl, 'href');
+        if (websiteHref) {
+          try {
+            const u = new URL(websiteHref, 'https://www.google.com');
+            if (u.pathname === '/url') {
+              websiteHref = u.searchParams.get('q') || u.searchParams.get('url') || websiteHref;
+            }
+          } catch {}
+          kp.website = websiteHref;
+          kp.websiteBtn = 'Yes';
+        }
+        // Span label-based fallbacks (matches your snippet)
+        const spans = Array.from(rhs.querySelectorAll('span.PbOY2e')) as HTMLSpanElement[];
+        const byLabel = (label: string) => spans.find(sp => (sp.textContent || '').trim().toLowerCase() === label);
+        // Website via span
+        if (!kp.website) {
+          const s = byLabel('website');
+          if (s) {
+            const a = s.closest('a') as HTMLAnchorElement | null;
+            let href = a?.getAttribute('href') || '';
+            if (href) {
+              try { const u = new URL(href, 'https://www.google.com'); if (u.pathname === '/url') href = u.searchParams.get('q') || u.searchParams.get('url') || href; } catch {}
+              kp.website = href; kp.websiteBtn = 'Yes';
+            }
+          }
+        }
+        // Directions button
+        const dirEl = rhs.querySelector('a[aria-label^="Directions" i], a[data-attrid*="directions"], a[href*="/maps/dir/"]');
+        const dirHref = getAttr(dirEl, 'href');
+        kp.hasDirections = !!dirHref || !!byLabel('directions');
+        // Call button
+        const callEl = rhs.querySelector('a[href^="tel:"], a[aria-label^="Call" i], button[aria-label^="Call" i]');
+        const telHref = getAttr(callEl, 'href');
+        if (telHref && telHref.startsWith('tel:')) {
+          kp.callAvailable = true;
+          kp.callBtn = 'Yes';
+        }
+        if (!kp.callAvailable && byLabel('call')) { kp.callAvailable = true; kp.callBtn = 'Yes'; }
+        // Schedule / Book online
+        const bookSpan = spans.find(sp => /\bbook\b|\bbook online\b|\bappointment\b/i.test((sp.textContent || '')));
+        if (bookSpan) { kp.scheduleAvailable = true; kp.scheduleBtn = 'Yes'; }
+        // A reasonable mapsUrl from panel
+        const mapsLink = rhs.querySelector('a[href*="/maps/place/"], a[href*="https://maps.app.goo.gl"], a[href*="https://goo.gl/maps"]');
+        const mapsHref = getAttr(mapsLink, 'href');
+        if (mapsHref) kp.url = mapsHref;
+
+        if (kp.title || kp.website || kp.url) {
+          out.push({
+            position: 1,
+            title: kp.title || '',
+            url: kp.url || '',
+            website: kp.website || '',
+            websiteBtn: kp.website ? 'Yes' : (kp.websiteBtn || 'No'),
+            callAvailable: !!kp.callAvailable,
+            callBtn: kp.callBtn || (kp.callAvailable ? 'Yes' : 'No'),
+            hasDirections: !!kp.hasDirections,
+            scheduleAvailable: !!kp.scheduleAvailable,
+            scheduleBtn: kp.scheduleBtn || (kp.scheduleAvailable ? 'Yes' : 'No'),
+            rating: '',
+            reviews: '',
+            category: '',
+            address: ''
+          });
+        }
+      }
+    } catch {}
+
+    // 1) Try Local Pack cards
+    const localPackSelectors = [
+      '.VkpGBb',             // container used by local pack items
+      '.uEierd',             // another local pack class (older / alternate)
+      '.GmE3X',              // fallback
+      '.xpdopen'             // generic group
+    ];
+    for (const sel of localPackSelectors) {
+      const nodes = Array.from(document.querySelectorAll(sel));
+      if (nodes.length) {
+        for (let i = 0; i < nodes.length && out.length < maxResults; i++) {
+          const n = nodes[i] as HTMLElement;
+          // Title/name
+          const name = text(n.querySelector('.dbg0pd, .BNeawe.vvjwJb, .qBF1Pd') || n.querySelector('a') || n.querySelector('div'));
+          // url - look for maps link or anchor
+          const anchor = n.querySelector('a[href*="google.com/maps"], a') as HTMLAnchorElement | null;
+          const url = (anchor && anchor.href) || '';
+          // rating & reviews
+          const ratingNode = n.querySelector('[aria-label*="stars"], span[role="img"], .BTEnNb');
+          const rating = (ratingNode && (ratingNode.getAttribute('aria-label') || ratingNode.textContent)) || '';
+          let reviews = '';
+          const revMatch = text(n.querySelector('.rllt__details span') || n.querySelector('.rllt__review') || n.querySelector('.Aq14fc'));
+          if (revMatch) {
+            const found = revMatch.match(/\d[\d,]*/);
+            reviews = found ? found[0] : revMatch;
+          }
+          // address/category heuristics - last small text
+          const detailTexts = Array.from(n.querySelectorAll('span, div')).map(el => text(el)).filter(Boolean);
+          const category = detailTexts.length ? detailTexts[0] : '';
+          const address = detailTexts.length > 1 ? detailTexts[detailTexts.length - 1] : '';
+          out.push({
+            position: out.length + 1,
+            title: name,
+            url,
+            rating: rating,
+            reviews: reviews,
+            category,
+            address,
+            description: ''
+          });
+        }
+        if (out.length) return out;
+      }
+    }
+
+    // 2) Try organic results (cards with .g or .tF2Cxc)
+    const organic = Array.from(document.querySelectorAll('.tF2Cxc, .g, .rc'));
+    for (let i = 0; i < organic.length && out.length < maxResults; i++) {
+      const node = organic[i] as HTMLElement;
+      const titleNode = node.querySelector('h3');
+      const anchor = node.querySelector('a') as HTMLAnchorElement | null;
+      const title = text(titleNode) || text(node.querySelector('.yuRUbf a') || node.querySelector('.DKV0Md'));
+      const url = (anchor && anchor.href) || node.querySelector('a')?.getAttribute('href') || '';
+      // sometimes rating appears in snippets (rare)
+      const snippet = text(node.querySelector('.IsZvec') || node.querySelector('.aCOpRe'));
+      let rating = '';
+      let reviews = '';
+      // check if url is maps one and attempt to extract rating/reviews present
+      if (url && url.includes('google.com/maps')) {
+        // sometimes rating appears near the link text
+        const rNode = node.querySelector('[aria-label*="stars"]');
+        rating = rNode ? (rNode.getAttribute('aria-label') || text(rNode)) : '';
+        const revNode = node.querySelector('span:contains("reviews"), span:contains("review")');
+        reviews = revNode ? text(revNode) : '';
+      }
+      out.push({
+        position: out.length + 1,
+        title,
+        url,
+        rating,
+        reviews,
+        category: '',
+        address: '',
+        description: snippet
+      });
+    }
+
+    // 3) Fallback: look for any anchors to google maps on the page
+    if (!out.length) {
+      const anchors = Array.from(document.querySelectorAll('a[href*="google.com/maps"]')) as HTMLAnchorElement[];
+      for (let i = 0; i < anchors.length && out.length < maxResults; i++) {
+        const a = anchors[i];
+        out.push({
+          position: out.length + 1,
+          title: a.textContent?.trim() || '',
+          url: a.href,
+          rating: '',
+          reviews: '',
+          category: '',
+          address: '',
+          description: ''
+        });
+      }
+    }
+
+    return out.slice(0, maxResults);
+  }, maxResults).catch(err => {
+    console.error('Error during evaluate in scrapeGoogleSearch:', err);
+    return [];
+  });
+
+  // Normalize some fields
+  return (results || []).map((r: any, i: number) => ({
+    position: r.position || i + 1,
+    title: (r.title || '').trim(),
+    url: r.url || '',
+    rating: (r.rating || '').toString().trim(),
+    reviews: (r.reviews || '').toString().trim(),
+    category: (r.category || '').toString().trim(),
+    address: (r.address || '').toString().trim(),
+    description: (r.description || '').toString().trim()
+  }));
+}
+
+/**
+ * scrapeMapsPlace
+ * - Visit maps.place page (or maps.google.com link) and attempt to extract core details.
+ * - Uses multiple selector fallbacks and normalizes output.
+ */
+async function scrapeMapsPlace(page: Page, placeUrl: string) {
+  const result: any = {
+    rating: 'N/A',
+    reviews: 'N/A',
+    address: 'N/A',
+    phone: 'N/A',
+    website: 'N/A',
+    category: 'N/A',
+    hours: 'N/A',
+    photosCount: '0',
+    about: 'N/A',
+    services: [],
+    popularTimes: [],
+    description: 'N/A',
+    posts: '0',
+    scheduleAvailable: false,
+    callAvailable: false,
+    hasDirections: false,
+    reviewCount: '0',
+    averageRating: '0.0',
+    websiteBtn: 'No',
+    scheduleBtn: 'No',
+    callBtn: 'No'
+  };
+
+  try {
+    console.log(`Visiting place URL: ${placeUrl}`);
+    const visited = await safeGoto(page, placeUrl, { timeout: 60000 });
+    if (!visited) return result;
+    // Set mapsUrl to the navigated URL for traceability
+    try { result.mapsUrl = page.url(); } catch { result.mapsUrl = placeUrl; }
+
+    // Wait heuristically for content - maps uses heavy dynamic rendering
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    // try to wait for h1 or a title-like element
+    try { await page.waitForSelector('h1, [data-testid="title"], .x3AX1-LfntMc-header-title', { timeout: 8000 }); } catch {}
+
+    // Additional short delay to ensure panel actions render
+    try {
+      // (Optional reliability improvement requested)
+      await new Promise(r => setTimeout(r, 1200));
+      await page.waitForFunction(() => !!document.querySelector('[data-item-id]'));
+    } catch {}
+
+    // Evaluate many possible selectors and gather values
+    const evaluateDetails = () => page.evaluate(() => {
+      const out: any = {};
+      const t = (sel: string) => {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        return el?.textContent?.trim() || '';
+      };
+      const has = (sel: string) => document.querySelector(sel) !== null;
+
+      // Name
+      out.name = t('h1') || t('[data-testid="title"]') || t('.x3AX1-LfntMc-header-title') || t('.section-hero-header-title');
+
+      // Rating and reviews
+      const ratingEl = document.querySelector('[aria-label*="stars"], [aria-label*="rating"]');
+      if (ratingEl) {
+        const ratingText = ratingEl.getAttribute('aria-label') || '';
+        const ratingMatch = ratingText.match(/([0-9.]+)/);
+        if (ratingMatch) {
+          out.averageRating = ratingMatch[1];
+          out.rating = `Rated ${out.averageRating} out of 5`;
+          
+          // Extract review count
+          const reviewText = ratingEl.parentElement?.textContent || '';
+          const reviewMatch = reviewText.match(/([0-9,]+) reviews?/i) || 
+                            reviewText.match(/([0-9,]+) ratings?/i);
+          if (reviewMatch) {
+            out.reviewCount = reviewMatch[1].replace(/,/g, '');
+            out.reviews = `${out.reviewCount} reviews`;
+          }
+        }
+      }
+
+      // Utilities
+      const unwrapGoogleRedirect = (href: string): string => {
+        if (!href) return href;
+        try {
+          if (href.startsWith('/')) {
+            href = 'https://www.google.com' + href;
+          }
+          const u = new URL(href, 'https://www.google.com');
+          if (u.hostname.includes('google.') && u.pathname === '/url') {
+            const q = u.searchParams.get('q') || u.searchParams.get('url');
+            if (q) return q;
+          }
+          return href;
+        } catch { return href; }
+      };
+
+      // queryDeep: pierce shallow and shadow DOMs to find the first matching element
+      const queryDeep = (selectors: string[]): Element | null => {
+        const walk = (roots: (Document | ShadowRoot | Element)[], depth = 0): Element | null => {
+          if (depth > 3) return null; // avoid deep recursion
+          for (const root of roots) {
+            for (const sel of selectors) {
+              const found = (root as any).querySelector?.(sel) || null;
+              if (found) return found as Element;
+            }
+            // explore shadow roots
+            const kids = Array.from((root as any).querySelectorAll?.('*') || []) as Element[];
+            const shadowRoots = kids.map(k => (k as any).shadowRoot).filter(Boolean) as ShadowRoot[];
+            if (shadowRoots.length) {
+              const r = walk(shadowRoots, depth + 1);
+              if (r) return r;
+            }
+          }
+          return null;
+        };
+        return walk([document]);
+      };
+
+      // More robust Website detection (shallow first)
+      const websiteCandidate = Array.from(document.querySelectorAll('a, button'))
+        .find(el => {
+          const label = (el.getAttribute('aria-label') || '').toLowerCase();
+          const text = (el.textContent || '').toLowerCase();
+          const dataId = (el.getAttribute('data-item-id') || '').toLowerCase();
+          const href = ((el as HTMLAnchorElement).getAttribute && (el as HTMLAnchorElement).getAttribute('href')) || '';
+          return (
+            href.includes('http') ||
+            label.includes('website') ||
+            text.includes('website') ||
+            text.includes('visit site') ||
+            text.includes('view website') ||
+            dataId.includes('website') ||
+            dataId.includes('authority')
+          );
+        }) as HTMLAnchorElement | HTMLButtonElement | undefined;
+
+      let siteEl: Element | null = websiteCandidate || null;
+      if (!siteEl) {
+        // Shadow DOM fallbacks often carry data-item-id="authority" or aria-label contains Website
+        siteEl = queryDeep([
+          '[data-item-id*="authority"]',
+          'a[aria-label*="Website" i]',
+          'button[aria-label*="Website" i]'
+        ]);
+      }
+
+      if (siteEl) {
+        let href = (websiteCandidate as HTMLAnchorElement).getAttribute?.('href') || '';
+        if (!href && siteEl) href = (siteEl as HTMLAnchorElement).getAttribute?.('href') || '';
+        // If still missing, try descendant anchor within authority container
+        if (!href && siteEl) {
+          const a = (siteEl as HTMLElement).querySelector?.('a');
+          href = a?.getAttribute('href') || '';
+        }
+        href = unwrapGoogleRedirect(href);
+        // Avoid social links and google internal
+        if (href && !/google\./i.test(href) && !/facebook\.com|twitter\.com|instagram\.com/i.test(href)) {
+          out.website = href;
+          out.websiteBtn = 'Yes';
+        }
+      } else {
+        // Explicit authority data-item-id fallback
+        const authority = queryDeep(['[data-item-id="authority"]', '[data-item-id*="authority"]']);
+        if (authority) {
+          let href = '';
+          const a = (authority as HTMLElement).querySelector?.('a');
+          href = a?.getAttribute('href') || '';
+          href = unwrapGoogleRedirect(href);
+          out.websiteBtn = 'Yes';
+          if (href && !/google\./i.test(href)) out.website = href;
+        }
+      }
+
+      // Enhanced call detection
+      const callCandidate = Array.from(document.querySelectorAll('a[href^="tel:"], button, a'))
+        .find(el => {
+          const href = ((el as HTMLAnchorElement).getAttribute && (el as HTMLAnchorElement).getAttribute('href')) || '';
+          const label = (el.getAttribute('aria-label') || '').toLowerCase();
+          const text = (el.textContent || '').toLowerCase();
+          const dataId = (el.getAttribute('data-item-id') || '').toLowerCase();
+          return (
+            href.startsWith('tel:') ||
+            label.includes('call') ||
+            label.includes('phone') ||
+            text.includes('call') ||
+            text.includes('phone') ||
+            dataId.includes('phone')
+          );
+        }) as HTMLAnchorElement | HTMLButtonElement | undefined;
+
+      let callEl: Element | null = callCandidate || null;
+      if (!callEl) {
+        callEl = queryDeep([
+          'a[href^="tel:"]',
+          '[data-item-id*="phone"]',
+          'button[aria-label*="Call" i]',
+          'a[aria-label*="Call" i]'
+        ]);
+      }
+
+      if (callEl) {
+        out.callAvailable = true;
+        out.callBtn = 'Yes';
+        const tel = (callEl as HTMLAnchorElement).getAttribute?.('href') || '';
+        if (tel && tel.startsWith('tel:') && (!out.phone || out.phone === 'N/A')) {
+          out.phone = tel.replace('tel:', '');
+        }
+      } else {
+        // data-item-id explicit fallback for phone
+        const phoneNode = queryDeep(['[data-item-id="phone:tel"]', '[data-item-id*="phone"]', 'a[href^="tel:"]']);
+        if (phoneNode) {
+          out.callAvailable = true;
+          out.callBtn = 'Yes';
+          const tel = (phoneNode as HTMLAnchorElement).getAttribute?.('href') || '';
+          if (tel && tel.startsWith('tel:')) out.phone = tel.replace('tel:', '');
+        }
+      }
+
+      // Enhanced schedule/booking detection
+      const scheduleCandidate = Array.from(document.querySelectorAll('button, a, div[role="button"]'))
+        .find(el => {
+          const href = ((el as HTMLAnchorElement).getAttribute && (el as HTMLAnchorElement).getAttribute('href')) || '';
+          const label = (el.getAttribute('aria-label') || '').toLowerCase();
+          const text = (el.textContent || '').toLowerCase();
+          const dataId = (el.getAttribute('data-item-id') || '').toLowerCase();
+          return (
+            href.includes('appointment') ||
+            href.includes('schedule') ||
+            label.includes('schedule') ||
+            label.includes('appointment') ||
+            text.includes('schedule') ||
+            text.includes('appointment') ||
+            text.includes('book') ||
+            text.includes('reserve') ||
+            dataId.includes('schedule') ||
+            dataId.includes('appointment') ||
+            dataId.includes('reserve') ||
+            dataId.includes('booking')
+          );
+        });
+      let scheduleEl: Element | null = scheduleCandidate || null;
+      if (!scheduleEl) {
+        scheduleEl = queryDeep([
+          '[data-item-id*="appointment"]',
+          '[data-item-id*="reserve"]',
+          '[data-item-id*="booking"]',
+          'button[aria-label*="Book" i]',
+          'a[aria-label*="Book" i]'
+        ]);
+      }
+
+      if (scheduleEl) {
+        out.scheduleAvailable = true;
+        out.scheduleBtn = 'Yes';
+      } else {
+        // explicit appointment fallback
+        const appt = queryDeep(['[data-item-id="appointment"]', '[data-item-id*="appointment"]', '[data-item-id*="reserve"]', '[data-item-id*="booking"]']);
+        if (appt) {
+          out.scheduleAvailable = true;
+          out.scheduleBtn = 'Yes';
+        }
+      }
+
+      // Enhanced directions detection
+      if (!out.hasDirections) {
+        const dirEl = queryDeep([
+          'a[href*="/dir/"]',
+          'a[aria-label*="Direction" i]',
+          'button[aria-label*="Direction" i]'
+        ]);
+        out.hasDirections = !!dirEl || has('button[aria-label*="direction" i], a[aria-label*="direction" i], button:has-text("Directions"), a[href*="/dir/"]');
+      }
+
+      // ---- Text-based fallbacks using span.PbOY2e from user's DOM snippet ----
+      try {
+        const byLabel = (label: string) => Array.from(document.querySelectorAll('span.PbOY2e'))
+          .find(sp => (sp.textContent || '').trim().toLowerCase() === label);
+
+        // Website
+        if (!out.website || out.website === 'N/A' || out.websiteBtn !== 'Yes') {
+          const siteSpan = byLabel('website');
+          if (siteSpan) {
+            const anc = siteSpan.closest('a') as HTMLAnchorElement | null;
+            let href = anc?.getAttribute('href') || '';
+            if (href) {
+              try {
+                const u = new URL(href, 'https://www.google.com');
+                if (u.pathname === '/url') {
+                  href = u.searchParams.get('q') || u.searchParams.get('url') || href;
+                }
+              } catch {}
+              out.website = href;
+              out.websiteBtn = 'Yes';
+            }
+          }
+        }
+
+        // Directions
+        if (!out.hasDirections) {
+          const dirSpan = byLabel('directions');
+          if (dirSpan) {
+            out.hasDirections = true;
+          }
+        }
+
+        // Call
+        if (!out.callAvailable || out.callBtn !== 'Yes') {
+          const callSpan = byLabel('call');
+          if (callSpan) {
+            const anc = callSpan.closest('[data-phone-number], a[href^="tel:"]') as HTMLElement | null;
+            if (anc) {
+              const tel = (anc.getAttribute('data-phone-number') || (anc as HTMLAnchorElement).getAttribute?.('href') || '').toString();
+              out.callAvailable = true;
+              out.callBtn = 'Yes';
+              if (tel.startsWith('tel:')) out.phone = tel.replace('tel:', '');
+              else if (/^\+?\d[\d\s-]+$/.test(tel)) out.phone = tel.trim();
+            }
+          }
+        }
+
+        // Schedule / Book online
+        if (!out.scheduleAvailable || out.scheduleBtn !== 'Yes') {
+          const bookSpan = Array.from(document.querySelectorAll('span.PbOY2e'))
+            .find(sp => /\bbook\b|\bbook online\b|\bappointment\b/i.test((sp.textContent || '')));
+          if (bookSpan) {
+            out.scheduleAvailable = true;
+            out.scheduleBtn = 'Yes';
+          }
+        }
+      } catch {}
+
+      // Enhanced posts detection with multiple strategies
+      let postsCount = '0';
+      
+      // Strategy 1: Look for posts count in the posts/updates section
+      const postsSection = Array.from(document.querySelectorAll('div, section, button, a'))
+        .find(el => {
+          const text = (el.textContent || '').toLowerCase();
+          return (text.includes('post') || text.includes('update')) && 
+                 (text.match(/\d+/) || text.includes('no posts'));
+        });
+      
+      if (postsSection) {
+        const postsText = postsSection.textContent || '';
+        const postsMatch = postsText.match(/(\d+)/);
+        if (postsMatch) postsCount = postsMatch[1];
+      }
+      
+      // Strategy 2: Look for posts in the business profile section
+      if (postsCount === '0') {
+        const profileSections = Array.from(document.querySelectorAll('[role="main"], [role="article"], [class*="section"], [class*="tabpanel"]'));
+        for (const section of profileSections) {
+          const sectionText = (section.textContent || '').toLowerCase();
+          if (sectionText.includes('posts') || sectionText.includes('updates')) {
+            const postsMatch = sectionText.match(/(\d+)\s*(posts|updates)/i);
+            if (postsMatch) {
+              postsCount = postsMatch[1];
+              break;
+            }
+          }
+        }
+      }
+      
+      // Strategy 3: Look for posts in the navigation/tabs
+      if (postsCount === '0') {
+        const navItems = Array.from(document.querySelectorAll('[role="tab"], [role="navigation"] a, [role="navigation"] button'));
+        const postsNav = navItems.find(el => {
+          const text = (el.textContent || '').toLowerCase();
+          return (text.includes('post') || text.includes('update')) && text.match(/\d+/);
+        });
+        
+        if (postsNav) {
+          const postsMatch = (postsNav.textContent || '').match(/(\d+)/);
+          if (postsMatch) postsCount = postsMatch[1];
+        }
+      }
+      
+      out.posts = postsCount;
+
+      // Reviews count: sometimes present in a button near rating
+      const reviewsBtn = Array.from(document.querySelectorAll('button, a')).find((el) => {
+        const txt = el.textContent || '';
+        return /review(s)?|ratings?/i.test(txt);
+      });
+      out.reviews = reviewsBtn?.textContent?.trim() || '';
+      const revMatch = out.reviews.match(/\d[\d,]*/);
+      out.reviews = revMatch ? revMatch[0] : (out.reviews || '');
+
+      // Address - many selectors
+      out.address =
+        t('button[data-item-id*="address"]') ||
+        t('button[aria-label*="Address"]') ||
+        t('[data-tooltip*="Copy address"]') ||
+        t('[data-section-id="ad"]') ||
+        t('.LrzXr') || '';
+
+      // Phone
+      out.phone =
+        t('button[data-item-id*="phone"]') ||
+        t('button[aria-label*="Phone"]') ||
+        t('.LrzXr.zdqRlf.kno-fv') || '';
+
+      // Website
+      const websiteEl = Array.from(document.querySelectorAll('a')).find(a => (a as HTMLAnchorElement).href && /http/i.test((a as HTMLAnchorElement).href) && !((a as HTMLAnchorElement).href.includes('maps.google')));
+      out.website = websiteEl ? (websiteEl as HTMLAnchorElement).href : '';
+
+      // Category - often near header
+      out.category = t('.Z1hOCe') || t('.LrzXr') || t('[data-section-id="category"]') || '';
+
+      // Hours - try multiple ways
+      out.hours = t('[data-hours-display]') || t('.WgFkxc') || t('button[aria-label*="hours"]') || '';
+
+      // About / description
+      out.description = t('[data-section-id="description"]') || t('[data-section-id="overview"]') || t('.w8qArf') || '';
+
+      // Services (if present)
+      const servicesNodes = Array.from(document.querySelectorAll('[data-section-id*="service"], .section-open-hours, .section-info-line'));
+      out.services = servicesNodes.map(n => n.textContent?.trim()).filter(Boolean);
+
+      // Photos count (button text)
+      const photoBtn = Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').match(/photo|photos|image/i));
+      const photoText = photoBtn?.textContent || '';
+      const pcMatch = (photoText.match(/\d[\d,]*/));
+      out.photosCount = pcMatch ? pcMatch[0] : '';
+
+      return out;
+    });
+
+    let details = await evaluateDetails();
+    // Retry a few times if buttons haven't rendered yet
+    const needRetry = (d: any) => !d || ((d.websiteBtn !== 'Yes') && (d.callBtn !== 'Yes') && (d.scheduleBtn !== 'Yes'));
+    for (let i = 0; i < 3 && needRetry(details); i++) {
+      await new Promise(r => setTimeout(r, 700));
+      try { await page.waitForFunction(() => !!document.querySelector('[data-item-id]')); } catch {}
+      details = await evaluateDetails();
+    }
+
+    // Merge results back into result object and normalize
+    if (details) {
+      result.rating = details.rating || result.rating;
+      result.reviews = details.reviews || result.reviews;
+      result.address = (details.address || result.address).replace(/\n+/g, ', ').trim();
+      result.phone = details.phone || result.phone;
+      result.website = details.website || result.website;
+      result.category = details.category || result.category;
+      result.hours = details.hours || result.hours;
+      result.photosCount = details.photosCount || result.photosCount;
+      result.websiteBtn = details.websiteBtn || result.websiteBtn;
+      result.callBtn = details.callBtn || result.callBtn;
+      result.scheduleBtn = details.scheduleBtn || result.scheduleBtn;
+      result.callAvailable = typeof details.callAvailable === 'boolean' ? details.callAvailable : result.callAvailable;
+      result.scheduleAvailable = typeof details.scheduleAvailable === 'boolean' ? details.scheduleAvailable : result.scheduleAvailable;
+      result.hasDirections = typeof details.hasDirections === 'boolean' ? details.hasDirections : result.hasDirections;
+    }
+
+    try {
+      const moreSelectors = [
+        'button[jsaction*="more"]',
+        'button[aria-expanded="false"]',
+        'button[aria-label*="Show more"]',
+        'button[aria-label*="More"]'
+      ];
+      for (const sel of moreSelectors) {
+        const btn = await (window as any).document.querySelector(sel);
+        if (btn) {
+          try { (btn as HTMLElement).click(); } catch {}
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // small delay to let more content load
+    await new Promise(r => setTimeout(r, 1200));
+  } catch (e) {
+    console.error('Error scraping maps place:', e);
+  }
+
+  // Add button detection
+  try {
+    const buttons = await page.$$eval("button, a", els =>
+      els.map(el => ({
+        text: el.textContent?.trim().toLowerCase() || "",
+        href: el.getAttribute('href') || ""
+      }))
+    );
+
+    // Check for website button
+    result.websiteBtn = buttons.some(b => 
+      b.text.includes("website") || 
+      b.href.includes("http") || 
+      b.href.includes("www.") ||
+      /(\.com|\.in|\.org|\/\/)/.test(b.href)
+    ) ? "Yes" : "No";
+
+    // Check for schedule button
+    result.scheduleBtn = buttons.some(b => 
+      b.text.includes("schedule") || 
+      b.text.includes("appointment") || 
+      b.text.includes("book") ||
+      b.text.includes("reserve") ||
+      b.text.includes("rsvp")
+    ) ? "Yes" : "No";
+
+    // Check for call button
+    result.callBtn = buttons.some(b => 
+      b.text.includes("call") || 
+      b.text.includes("phone") || 
+      b.href.startsWith("tel:")
+    ) ? "Yes" : "No";
+  } catch (err) {
+    console.error("Error checking buttons:", err);
+    result.websiteBtn = "Error";
+    result.scheduleBtn = "Error";
+    result.callBtn = "Error";
+  }
+
+  // Set default values if not detected
+  result.websiteBtn = result.websiteBtn || "No";
+  result.scheduleBtn = result.scheduleBtn || "No";
+  result.callBtn = result.callBtn || "No";
+
+  // sanitize strings
+  Object.keys(result).forEach(key => {
+    if (typeof result[key] === 'string') {
+      result[key] = result[key].replace(/[\n\t\r]+/g, ' ').trim();
+    }
+  });
+
+  console.log('Extracted competitor details (maps):', JSON.stringify(result, null, 2));
+  return result;
+}
+
+// Resolve short-link maps.app.goo.gl → full /maps/place URL and attempt to extract business/city fallback
+async function resolveShortGmbUrl(inputUrl: string): Promise<{ url: string; business?: string; city?: string }> {
+  try {
+    let url = inputUrl;
+    let business: string | undefined;
+    let city: string | undefined;
+
+    // Follow redirects using fetch HEAD (best-effort) - Node 18+ has fetch builtin
+    if (url.includes('maps.app.goo.gl') || url.includes('goo.gl/maps')) {
+      for (let i = 0; i < 5; i++) {
+        try {
+          const resp = await fetch(url, { method: 'HEAD', redirect: 'manual' as any, headers: { 'User-Agent': 'Mozilla/5.0' } });
+          const loc = resp.headers.get('location');
+          if (resp.status >= 300 && resp.status < 400 && loc) {
+            url = new URL(loc, url).toString();
+            if (url.includes('/place/') || url.includes('maps.google.com')) break;
+            continue;
+          }
+          break;
+        } catch {
+          await new Promise(r => setTimeout(r, 400 + i * 200));
+        }
+      }
+    }
+
+    try {
+      const urlObj = new URL(url);
+      if (urlObj.pathname.includes('/place/')) {
+        const placePart = urlObj.pathname.split('/place/')[1] || '';
+        const firstPart = placePart.split('/')[0] || '';
+        const parts = firstPart.split('+').map(p => p.replace(/[^a-zA-Z0-9\s]/g, '').trim()).filter(Boolean);
+        if (parts.length > 0) {
+          business = parts[0];
+        }
+        if (parts.length > 1) {
+          city = parts[parts.length - 1];
+        }
+      }
+    } catch {}
+
+    return { url, business, city };
+  } catch (error) {
+    console.error('Error resolving URL:', error);
+    return { url: inputUrl };
+  }
+}
+
+// Generate keyword ideas using Gemini (via getAiGeneratedText)
+export async function generateKeywordIdeas(gmbUrl: string): Promise<{ business: string; city: string; keywords: KeywordIdea[] }> {
+  const { url: expandedUrl, business: detectedBusiness, city: detectedCity } = await resolveShortGmbUrl(gmbUrl);
+
+  console.log('Expanded URL:', expandedUrl);
+
+  const prompt = `
+You are a local SEO expert.
+Given this Google Maps URL: ${expandedUrl}
+
+1. Identify the business name.
+2. Identify the city.
+3. Provide exactly 5 UNIQUE top search queries (keywords) that customers might use to find this business.
+Rules:
+- Do NOT include the brand/business name in queries.
+- Do NOT include duplicate or synonymous keywords.
+- Use the inferred city for location in queries.
+- Do NOT use "near me".
+Output JSON ONLY in this format:
+{
+  "business": "<Business Name>",
+  "city": "<City>",
+  "keywords": [
+    {"keyword":"<service>","query":"best <service> in <city>"},
+    {"keyword":"<service>","query":"top rated <service> <city>"},
+    {"keyword":"<service>","query":"<service> services in <city>"},
+    {"keyword":"<service>","query":"<service> providers in <city>"},
+    {"keyword":"<service>","query":"affordable <service> in <city>"}
+  ]
+}
+`;
+
+  const text = await getAiGeneratedText(prompt);
+
+  try {
+    let cleaned = text.trim();
+    if (cleaned.startsWith('```') && cleaned.endsWith('```')) {
+      cleaned = cleaned.slice(3, -3).trim();
+      if (cleaned.startsWith('json')) cleaned = cleaned.slice(4).trim();
+    }
+    const firstBrace = cleaned.indexOf('{');
+    const lastBrace = cleaned.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+    }
+    const obj = JSON.parse(cleaned);
+    const seen = new Set<string>();
+    const keywords: KeywordIdea[] = [];
+    if (Array.isArray(obj.keywords)) {
+      for (const item of obj.keywords) {
+        if (item && typeof item === 'object' && item.keyword && item.query) {
+          const keyword = String(item.keyword).trim();
+          const query = String(item.query).trim();
+          if (keyword && query && !seen.has(keyword.toLowerCase())) {
+            seen.add(keyword.toLowerCase());
+            keywords.push({ keyword, query });
+            if (keywords.length >= 5) break;
+          }
+        }
+      }
+    }
+    const business = obj.business ? String(obj.business).trim() : detectedBusiness || 'Unknown';
+    const city = obj.city ? String(obj.city).trim() : detectedCity || '';
+    return { business, city, keywords };
+  } catch (e) {
+    console.error('Failed to parse AI response:', e);
+    return { business: detectedBusiness || 'Unknown', city: detectedCity || '', keywords: [] };
+  }
+}
+
+// Generate rankings using web scraping (puppeteer-extra + stealth)
+async function generateScrapedRankings(keywords: KeywordIdea[], businessName: string, city: string): Promise<RankingRow[]> {
+  const results: RankingRow[] = [];
+
+  // Persist a browser profile to reduce CAPTCHAs (cookies, cache, local storage)
+  const userDataDir = process.env.USER_DATA_DIR || path.resolve(process.cwd(), '.puppeteer_profile');
+  try { fs.mkdirSync(userDataDir, { recursive: true }); } catch {}
+
+  const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?: string } = {
+    headless: false,
+    ignoreHTTPSErrors: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--lang=en-IN',
+      '--window-position=0,0',
+      '--window-size=1366,768',
+      '--metrics-recording-only',
+      '--mute-audio',
+      '--no-first-run'
+    ],
+    defaultViewport: {
+      width: 1366 + Math.floor(Math.random() * 200),
+      height: 768 + Math.floor(Math.random() * 200),
+      deviceScaleFactor: 1,
+      hasTouch: false,
+      isLandscape: false,
+    },
+    // Important: persistent profile for fewer CAPTCHAs across runs
+    userDataDir
+  };
+
+  const browser = await puppeteer.launch(launchOptions) as Browser;
+  const page = await browser.newPage();
+
+  // Randomize User-Agent once per run from a small desktop pool
+  const uaPool = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36'
+  ];
+  const ua = uaPool[Math.floor(Math.random() * uaPool.length)];
+  await page.setUserAgent(ua);
+  // Emulate Indian locale and timezone for this session
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-IN,en;q=0.9' });
+  try {
+    const client = await page.target().createCDPSession();
+    await client.send('Emulation.setTimezoneOverride', { timezoneId: process.env.TZ_OVERRIDE || 'Asia/Kolkata' });
+  } catch {}
+  // Align navigator languages
+  try {
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-IN','en'] });
+      Object.defineProperty(navigator, 'language', { get: () => 'en-IN' });
+    });
+  } catch {}
+
+  const normalize = (s?: string) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  // const normalizedBusiness = normalize(businessName);
+  // Build significant tokens from the business name; avoid hardcoded stopwords.
+  // Optional user-provided stopwords via env: GMB_STOPWORDS="word1,word2,word3"
+  const userStops = (process.env.GMB_STOPWORDS || '')
+    .toLowerCase()
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const userStopSet = new Set(userStops);
+  const sigTokens = (businessName || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(t => t && t.length >= 3 && !userStopSet.has(t));
+
+  // Capture canonical RHS name from the expanded URL page as our primary target
+  let targetName = '';
+  try {
+    try { await page.waitForSelector('[role="main"] h1, .DUwDvf, [data-attrid="title"]', { timeout: 8000 }); } catch {}
+    targetName = await page.evaluate(() => (document.querySelector('[role="main"] h1, .DUwDvf, [data-attrid="title"]')?.textContent || '').trim());
+  } catch {}
+  // Compute a core prefix (before :, -, |, ( ) or similar separators)
+  const extractCore = (s: string) => {
+    const idx = s.search(/[:\-|()]/);
+    const head = idx > 0 ? s.slice(0, idx) : s;
+    return head.trim();
+  };
+  const corePrefix = extractCore(targetName || businessName || '').trim();
+  const corePrefixNorm = normalize(corePrefix);
+
+  // Will be used both during Local Finder selection and afterwards
+  let topCompetitor: any = null;
+  let competitorRank = -1;
+
+  try {
+    // Try to set geolocation to target city for this session
+    try {
+      const client = await page.target().createCDPSession();
+      // Rough coordinates for India fallback; will adjust if we can parse the city
+      let lat = 23.2599, lon = 77.4126; // Bhopal default
+      if (city && city.toLowerCase().includes('bhopal')) { lat = 23.2599; lon = 77.4126; }
+      await client.send('Emulation.setGeolocationOverride', { latitude: lat, longitude: lon, accuracy: 30 });
+      const context = browser.defaultBrowserContext();
+      try { await context.overridePermissions('https://www.google.com', ['geolocation']); } catch {}
+    } catch {}
+
+    for (const kw of keywords) {
+      let searchQuery = kw.query;
+      searchQuery = searchQuery.replace(/^best\s+/i, '').trim();
+      searchQuery = `Best ${searchQuery}`;
+      if (!searchQuery.toLowerCase().includes(` in ${city.toLowerCase()}`)) {
+        searchQuery = `${searchQuery} in ${city}`;
+      }
+
+      console.log(`Searching: ${searchQuery}`);
+      await randomDelay(800, 2200);
+      const searchResults = await scrapeGoogleSearch(page, searchQuery, 20);
+
+      if (!searchResults || searchResults.length === 0) {
+        console.warn('No search results found for:', kw.query);
+        const result = {
+          keyword: kw.keyword,
+          yourRanking: 'N/A',
+          topCompetitor: 'No competitor found',
+          theirRank: 'N/A',
+          competitorDetails: {
+            rating: 'N/A',
+            reviews: 'N/A',
+            category: 'N/A',
+            address: 'N/A',
+            phone: 'N/A',
+            website: 'N/A',
+            mapsUrl: 'N/A',
+            hours: 'N/A',
+            about: 'N/A',
+            services: [],
+            description: 'N/A'
+          },
+          rating: 'N/A',
+          reviews: 'N/A',
+          category: 'N/A',
+          address: 'N/A',
+          phone: 'N/A',
+          website: 'N/A',
+          mapsUrl: 'N/A',
+          lastUpdated: new Date().toISOString()
+        };
+        results.push(result);
+        continue;
+      }
+
+      // prefer local pack / maps links if available
+      const localPack = searchResults.filter((r: { url?: string }) => r.url && r.url.includes('google.com/maps'));
+      const primarySource = localPack.length ? localPack : searchResults;
+
+      let ourRank = -1;
+      for (let i = 0; i < primarySource.length; i++) {
+        const r = primarySource[i];
+        const normTitle = normalize(r.title);
+        const normUrl = (r.url || '').toLowerCase();
+        // Be strict: only accept if the core business prefix is present in title or URL
+        if (corePrefixNorm && corePrefixNorm.length >= 4 && ((normTitle && normTitle.includes(corePrefixNorm)) || (normUrl && normUrl.includes(corePrefixNorm)))) {
+          ourRank = i + 1;
+          break;
+        }
+      }
+
+      // Fallback: open 'More places' (Local Finder) and search the entire list for our business
+      if (ourRank === -1) {
+        try {
+          console.log('[Local Finder] Attempting to open full list via "More places"...');
+          // Try to find and click the 'More places' link (without using $x)
+          let clicked = false;
+          const anchors = await page.$$('a');
+          for (const a of anchors) {
+            try {
+              const info = await a.evaluate((el: Element) => ({
+                text: (el.textContent || '').trim().toLowerCase(),
+                aria: (el.getAttribute('aria-label') || '').toLowerCase(),
+              }));
+              if (info.text.includes('more places') || info.aria.startsWith('more places')) {
+                await a.click();
+                clicked = true;
+                break;
+              }
+            } catch {}
+          }
+          if (!clicked) {
+            // Try common button variants for More places
+            const button = await page.$('a[aria-label^="More places"], a[href*="/maps?"], div[role="button"][jsaction][data-hveid]');
+            if (button) { await button.click(); clicked = true; }
+          }
+
+          if (clicked) {
+            // Some variants open the Local Finder in a NEW TAB/POPUP. Capture it if present.
+            let lfPage: Page | null = null;
+            try {
+              const targetPromise = browser.waitForTarget(t => {
+                try { return t.opener() === page.target() && /google\.[^/]+\/maps/i.test(t.url()); } catch { return false; }
+              }, { timeout: 5000 });
+              // Give the click a moment to spawn popup
+              try { const target = await targetPromise; lfPage = target ? await target.page() : null; } catch {}
+            } catch {}
+
+            // If no popup, we assume same-tab navigation
+            try { await (lfPage || page).waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }); } catch {}
+            // Wait for Local Finder containers to appear
+            try {
+              await (lfPage || page).waitForSelector('div[role="feed"] [role="article"], a.hfpxzc, div[aria-label*="Results for"] [role="article"], .Nv2PK', { timeout: 15000 });
+            } catch {}
+            // Give list time to render more fully
+            await randomDelay(2500, 4000);
+
+            // Robust scan of Local Finder results for business rank
+            let rankInFinder = -1;
+            try {
+              const scanRes = await scanLocalFinderForBusiness({
+                page,
+                lfPage,
+                sigTokens,
+                corePrefixNorm,
+                maxScrolls: 20,
+                scrollDelayMin: 1000,
+                scrollDelayMax: 1700,
+              });
+              if (scanRes.foundIndex && scanRes.foundIndex > 0) {
+                rankInFinder = scanRes.foundIndex;
+                console.log(`[Local Finder] Found business at rank ${rankInFinder} — title: ${scanRes.foundTitle}`);
+              } else {
+                console.log('[Local Finder] Not found after scrolling attempts.');
+              }
+            } catch (e) {
+              console.log('[Local Finder] Scan error:', e instanceof Error ? e.message : e);
+            }
+            if (rankInFinder && rankInFinder > 0) {
+              ourRank = rankInFinder;
+            }
+            // Try to go back to the SERP to keep flow consistent
+            try {
+              if (lfPage && !lfPage.isClosed()) { await lfPage.close().catch(() => {}); }
+              else { await page.goBack({ waitUntil: 'networkidle2' }); }
+            } catch {}
+          }
+        } catch {}
+      }
+
+      // topCompetitor and competitorRank already declared above for Local Finder usage
+      for (let i = 0; i < primarySource.length; i++) {
+        const r = primarySource[i];
+        const normTitle = normalize(r.title);
+        const normUrl = (r.url || '').toLowerCase();
+        // Skip if this looks like our business (corePrefixNorm in title/url)
+        if (corePrefixNorm && ((normTitle && normTitle.includes(corePrefixNorm)) || (normUrl && normUrl.includes(corePrefixNorm)))) {
+          continue;
+        }
+        topCompetitor = r;
+        competitorRank = i + 1;
+        break;
+      }
+
+      // Initialize default competitor details
+      let competitorDetails: CompetitorDetails = {
+        rating: 'N/A',
+        reviews: 'N/A',
+        category: 'N/A',
+        address: 'N/A',
+        phone: 'N/A',
+        website: 'N/A',
+        mapsUrl: 'N/A',
+        hours: 'N/A',
+        about: 'N/A',
+        services: [],
+        description: 'N/A',
+        posts: '0',
+        scheduleAvailable: false,
+        callAvailable: false,
+        hasDirections: false,
+        reviewCount: '0',
+        averageRating: '0.0',
+        // Button availability flags (default to 'No')
+        websiteBtn: 'No',
+        scheduleBtn: 'No',
+        callBtn: 'No'
+      };
+
+      if (topCompetitor) {
+        // First, get basic details from the search result
+        // Extract phone from snippet if present (fallback when Call button not available)
+        let snippetPhone = '';
+        try {
+          const blob = `${topCompetitor.description || ''} ${topCompetitor.address || ''}`;
+          const m = blob.match(/\+?\d[\d\s-]{7,}\d/);
+          if (m) {
+            snippetPhone = m[0].replace(/[^\d+]/g, '');
+          }
+        } catch {}
+
+        competitorDetails = {
+          ...competitorDetails,
+          rating: topCompetitor.rating || 'N/A',
+          reviews: topCompetitor.reviews || '0',
+          category: topCompetitor.category || 'N/A',
+          address: topCompetitor.address || 'N/A',
+          website: topCompetitor.url && !topCompetitor.url.includes('google.com/maps') ? topCompetitor.url : 'N/A',
+          mapsUrl: topCompetitor.url && topCompetitor.url.includes('google.com/maps') ? topCompetitor.url : 'N/A',
+          phone: snippetPhone || 'N/A',
+          callAvailable: !!snippetPhone || competitorDetails.callAvailable,
+          callBtn: (snippetPhone ? 'Yes' : competitorDetails.callBtn)
+        };
+
+        // Perform a targeted search for this competitor to get more detailed information
+        try {
+          console.log(`Performing detailed search for: ${topCompetitor.title}`);
+          const searchQuery = `${topCompetitor.title} ${city}`;
+          
+          // Navigate to Google search for this specific competitor
+          // Small pre-delay so the SERP stabilizes before navigating (shortened)
+          await randomDelay(500, 1100);
+          await safeGoto(page, `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}`);
+          
+          // Wait for search results to load
+          await page.waitForSelector('div[data-attrid="title"]', { timeout: 7000 }).catch(() => null);
+
+          // First, scan the RHS panel globally for action chips (Website/Directions/Call/Book)
+          try {
+            const rhs = await page.evaluate(() => {
+              const out: any = {};
+              const unwrap = (href: string): string => {
+                try {
+                  if (!href) return href;
+                  const u = new URL(href, 'https://www.google.com');
+                  if (u.pathname === '/url') {
+                    return u.searchParams.get('q') || u.searchParams.get('url') || href;
+                  }
+                  return href;
+                } catch { return href; }
+              };
+
+              const spans = Array.from(document.querySelectorAll('span.PbOY2e')) as HTMLSpanElement[];
+              const byLabel = (label: string) => spans.find(sp => (sp.textContent || '').trim().toLowerCase() === label);
+
+              // Website
+              const wSpan = byLabel('website');
+              if (wSpan) {
+                const a = wSpan.closest('a') as HTMLAnchorElement | null;
+                let href = a?.getAttribute('href') || '';
+                if (!href) {
+                  const container = wSpan.closest('.n1obkb.mI8Pwc') as HTMLElement | null;
+                  href = (container?.querySelector('a[href]') as HTMLAnchorElement | null)?.getAttribute('href') || '';
+                }
+                href = unwrap(href);
+                if (href && !/google\./i.test(href)) {
+                  out.website = href; out.websiteBtn = 'Yes';
+                } else if (wSpan) {
+                  out.websiteBtn = 'Yes';
+                }
+              }
+
+              // Directions
+              if (byLabel('directions')) out.hasDirections = true;
+
+              // Call
+              const cSpan = byLabel('call');
+              if (cSpan) {
+                const container = cSpan.closest('.n1obkb.mI8Pwc, .Od1FEc.n1obkb') as HTMLElement | null;
+                const tel = container?.getAttribute('data-phone-number') || (container?.querySelector('a[href^="tel:"]') as HTMLAnchorElement | null)?.getAttribute('href') || '';
+                out.callAvailable = true; out.callBtn = 'Yes';
+                if (tel.startsWith('tel:')) out.phone = tel.replace('tel:', '');
+                else if (/^\+?\d[\d\s-]+$/.test(tel)) out.phone = tel.trim();
+              }
+
+              // Book / Appointment
+              const book = spans.find(sp => /\bbook\b|\bbook online\b|\bappointment\b/i.test((sp.textContent || '')));
+              if (book) { out.scheduleAvailable = true; out.scheduleBtn = 'Yes'; }
+
+              return out;
+            });
+
+            if (rhs) {
+              if (rhs.website) { competitorDetails.website = rhs.website; }
+              if (rhs.websiteBtn) { competitorDetails.websiteBtn = rhs.websiteBtn; }
+              if (rhs.hasDirections) { competitorDetails.hasDirections = true; }
+              if (rhs.callAvailable) { competitorDetails.callAvailable = true; competitorDetails.callBtn = 'Yes'; }
+              if (rhs.phone && competitorDetails.phone === 'N/A') { competitorDetails.phone = rhs.phone; }
+              if (rhs.scheduleAvailable) { competitorDetails.scheduleAvailable = true; competitorDetails.scheduleBtn = 'Yes'; }
+            }
+          } catch {}
+          
+          // Look for the knowledge panel or local pack result
+          let businessCard = await page.$('div[data-attrid="kc:/location/location:business entity"]');
+          if (!businessCard) {
+            businessCard = await page.$('div[data-attrid="kc:/local:local result"]');
+          }
+          if (!businessCard) {
+            const titleElement = await page.$('div[data-attrid="title"]');
+            if (titleElement) {
+              try {
+                // Use evaluate to get the parent element
+                const parentHandle = await page.evaluateHandle((el: HTMLElement) => {
+                  return el.closest('div[data-attrid^="kc:/"]') || el.parentElement;
+                }, titleElement);
+                
+                const element = await parentHandle.asElement();
+                if (element) {
+                  // Cast to any to avoid type issues with parent element
+                  businessCard = element as unknown as ElementHandle<HTMLDivElement>;
+                }
+              } catch (error) {
+                console.warn('Error getting parent element:', error);
+              }
+            }
+          }
+          
+          if (businessCard) {
+            // Extract rating if available
+            const ratingEl = await businessCard.$('[aria-label*="stars"], [aria-label*="rating"]');
+            if (ratingEl) {
+              const ratingText = await ratingEl.evaluate((el: Element) => el.getAttribute('aria-label') || '');
+              const ratingMatch = ratingText.match(/([0-9.]+)/);
+              if (ratingMatch) {
+                competitorDetails.rating = `Rated ${ratingMatch[1]} out of 5`;
+                competitorDetails.averageRating = ratingMatch[1];
+              }
+              
+              // Extract review count
+              const reviewText = await ratingEl.evaluate((el: Element) => {
+                const parent = el.parentElement as HTMLElement | null;
+                return parent?.textContent || '';
+              });
+              // Support formats like 1K, 2.3K, 1,234
+              const m1 = reviewText.match(/\(([^)]+)\)/); // try inside parens first
+              const token = (m1?.[1] || reviewText || '').trim();
+              let rev = 0;
+              const mKM = token.match(/([0-9]+(?:\.[0-9]+)?)\s*([kKmM])/);
+              if (mKM) {
+                const n = parseFloat(mKM[1]);
+                const mult = mKM[2].toLowerCase() === 'm' ? 1_000_000 : 1_000;
+                rev = Math.round(n * mult);
+              } else {
+                const mNum = token.match(/([0-9][0-9,]*)/);
+                if (mNum) rev = parseInt(mNum[1].replace(/,/g, ''), 10);
+              }
+              if (rev > 0) {
+                competitorDetails.reviewCount = String(rev);
+                competitorDetails.reviews = `${rev} reviews`;
+              }
+            }
+            
+            // Check for website - more comprehensive detection
+            const websiteEl = await businessCard.$('a[href*="website"], a[href*=".com"], a[href*=".in"], a[href*=".org"], a[href*=".net"]');
+            if (websiteEl) {
+              const websiteUrl = await websiteEl.evaluate((el: Element) => {
+                const anchor = el as HTMLAnchorElement;
+                // Only return valid URLs
+                try {
+                  const url = new URL(anchor.href);
+                  return url.href;
+                } catch {
+                  return '';
+                }
+              });
+              competitorDetails.website = websiteUrl || 'N/A';
+              // Mark Website button as present
+              competitorDetails.websiteBtn = websiteUrl ? 'Yes' : 'No';
+            } else {
+              // Fallback: detect a visible Website button without href by checking text
+              const hasWebsiteBtn = await businessCard.evaluate((root) => {
+                const els = Array.from(root.querySelectorAll('button, a, [role="button"]')) as HTMLElement[];
+                return els.some(el => (el.textContent || '').trim().toLowerCase().includes('website'));
+              });
+              if (hasWebsiteBtn) {
+                competitorDetails.websiteBtn = 'Yes';
+              }
+            }
+            
+            // Check for posts in the business profile
+            try {
+              const postsElement = await businessCard.$('[data-attrid*="kc:/local:post"]');
+              if (postsElement) {
+                const postsText = await postsElement.evaluate(el => el.textContent || '');
+                const postsMatch = postsText.match(/(\d+)/);
+                if (postsMatch) {
+                  competitorDetails.posts = postsMatch[1];
+                }
+              }
+            } catch (error) {
+              console.warn('Error checking for posts:', error);
+            }
+            
+            // Check for call button - more comprehensive detection
+            const callButton = await businessCard.$([
+              'a[href^="tel:"]',
+              '[aria-label*="call" i]',
+              '[aria-label*="phone" i]',
+              '[data-tooltip*="call" i]',
+              '[data-tooltip*="phone" i]'
+            ].join(','));
+            
+            if (callButton) {
+              competitorDetails.callAvailable = true;
+              competitorDetails.phone = await callButton.evaluate((el: Element) => {
+                // Clean up phone number
+                const phoneText = el.textContent?.trim() || '';
+                return phoneText.replace(/[^\d+]/g, '') || 'N/A';
+              });
+              // Mark Call button as present
+              competitorDetails.callBtn = 'Yes';
+            } else {
+              // Fallback: detect a visible Call button without attributes by checking text
+              const hasCallBtn = await businessCard.evaluate((root) => {
+                const els = Array.from(root.querySelectorAll('button, a, [role="button"]')) as HTMLElement[];
+                return els.some(el => (el.textContent || '').trim().toLowerCase().includes('call'));
+              });
+              if (hasCallBtn) {
+                competitorDetails.callAvailable = true;
+                competitorDetails.callBtn = 'Yes';
+              }
+            }
+            
+            // Check for schedule button - more comprehensive detection
+            const scheduleButton = await businessCard.$([
+              'button[aria-label*="schedule" i]',
+              'button[aria-label*="appointment" i]',
+              'button[aria-label*="booking" i]',
+              '[data-tooltip*="schedule" i]',
+              '[data-tooltip*="appointment" i]',
+              'a[href*="booking" i]',
+              'a[href*="appointment" i]'
+            ].join(','));
+            
+            if (scheduleButton) {
+              competitorDetails.scheduleAvailable = true;
+              // Mark Schedule button as present
+              competitorDetails.scheduleBtn = 'Yes';
+            } else {
+              // Fallback: detect by visible text variants
+              const hasScheduleBtn = await businessCard.evaluate((root) => {
+                const textHas = (s: string) => (s || '').toLowerCase();
+                const els = Array.from(root.querySelectorAll('button, a, [role="button"]')) as HTMLElement[];
+                return els.some(el => {
+                  const t = textHas(el.textContent || '');
+                  return t.includes('schedule') || t.includes('appointment') || t.includes('book') || t.includes('reserve');
+                });
+              });
+              if (hasScheduleBtn) {
+                competitorDetails.scheduleAvailable = true;
+                competitorDetails.scheduleBtn = 'Yes';
+              }
+            }
+            
+            // Attempt to open Photos overlay and count tiles (posts proxy)
+            try {
+              // 1) Try aria-label based quick click on SERP RHS
+              let clickedPhotos = false;
+              const ariaPhotos = await page.$('[aria-label^="See photos" i], [aria-label*="See photos" i], a[aria-label*="Photos" i], [role="button"][aria-label*="Photos" i]');
+              if (ariaPhotos) { await ariaPhotos.click(); clickedPhotos = true; }
+              // 1b) If not, try text-based candidates
+              if (!clickedPhotos) {
+                const candidates = await page.$$('a, button, [role="button"]');
+                for (const h of candidates) {
+                  try {
+                    const txt = (await h.evaluate(el => (el.textContent || '').trim().toLowerCase())) || '';
+                    if (txt.includes('see photos') || txt === 'photos' || txt.includes('photos')) {
+                      await h.click();
+                      clickedPhotos = true;
+                      break;
+                    }
+                  } catch {}
+                }
+              }
+              if (clickedPhotos) {
+                try { await page.waitForSelector('div[role="dialog"], div[aria-label*="Photos" i]', { timeout: 8000 }); } catch {}
+                // Count photo tiles by scrolling the overlay container
+                const total = await page.evaluate(async () => {
+                  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+                  // Common overlay scroll container
+                  const overlay = (document.querySelector('div[role="dialog"] .U26fgb, div[role="dialog"] .OFaVn, div[role="dialog"] .nIWXKc') as HTMLElement)
+                    || (document.querySelector('div[role="dialog"]') as HTMLElement)
+                    || document.body;
+                  let prev = 0;
+                  for (let i = 0; i < 6; i++) {
+                    try { overlay.scrollBy(0, Math.max(overlay.clientHeight, 600)); } catch {}
+                    await sleep(600);
+                    const tiles = Array.from(document.querySelectorAll('div[role="dialog"] [role="gridcell"], div[role="dialog"] a[role="link"], div[role="dialog"] img'));
+                    if (tiles.length <= prev) break;
+                    prev = tiles.length;
+                  }
+                  const tiles = Array.from(document.querySelectorAll('div[role="dialog"] [role="gridcell"], div[role="dialog"] a[role="link"], div[role="dialog"] img'));
+                  return tiles.length;
+                });
+                if (Number.isFinite(total) && total > 0) {
+                  competitorDetails.posts = String(total);
+                }
+                // Close overlay
+                try {
+                  const closeBtn = await page.$('div[role="dialog"] [aria-label="Close" i], div[role="dialog"] button[aria-label*="Close" i]');
+                  if (closeBtn) await closeBtn.click(); else await page.keyboard.press('Escape');
+                } catch {}
+                await randomDelay(300, 700);
+              }
+              // 2) Fallback: open Maps place URL and navigate to Photos grid
+              if (!clickedPhotos && (competitorDetails.mapsUrl && competitorDetails.mapsUrl !== 'N/A')) {
+                try {
+                  await safeGoto(page, competitorDetails.mapsUrl);
+                  try { await page.waitForSelector('.m6QEr, [role="main"]', { timeout: 12000 }); } catch {}
+                  // Try clicking Photos tab/button
+                  let clicked = false;
+                  const photosBtn = await page.$('a[aria-label*="Photos" i], button[aria-label*="Photos" i], [role="link"][aria-label*="Photos" i]');
+                  if (photosBtn) { await photosBtn.click(); clicked = true; }
+                  if (!clicked) {
+                    const chips = await page.$$('a, button, [role="button"]');
+                    for (const c of chips) {
+                      try {
+                        const t = (await c.evaluate(el => (el.textContent || '').trim().toLowerCase())) || '';
+                        if (t.includes('photos')) { await c.click(); clicked = true; break; }
+                      } catch {}
+                    }
+                  }
+                  if (clicked) {
+                    try { await page.waitForSelector('[role="grid"], [role="main"] img', { timeout: 8000 }); } catch {}
+                    const total2 = await page.evaluate(async () => {
+                      const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+                      const scrollArea = (document.querySelector('.m6QEr[aria-label], .DxyBCb .m6QEr') as HTMLElement) || document.body;
+                      let prev = 0;
+                      for (let i = 0; i < 8; i++) {
+                        try { scrollArea.scrollBy(0, Math.max(scrollArea.clientHeight, 700)); } catch {}
+                        await sleep(500);
+                        const tiles = Array.from(document.querySelectorAll('[role="gridcell"], a[role="link"], img[src]'));
+                        if (tiles.length <= prev) break;
+                        prev = tiles.length;
+                      }
+                      const tiles = Array.from(document.querySelectorAll('[role="gridcell"], a[role="link"], img[src]'));
+                      return tiles.length;
+                    });
+                    if (Number.isFinite(total2) && total2 > 0) {
+                      competitorDetails.posts = String(total2);
+                    }
+                  }
+                } catch {}
+              }
+            } catch {}
+            
+            // Extract address
+            const addressEl = await businessCard.$('[data-tooltip*="address"], [aria-label*="address"]');
+            if (addressEl) {
+              competitorDetails.address = await addressEl.evaluate((el: Element) => el.textContent?.trim() || 'N/A');
+              competitorDetails.hasDirections = true;
+            }
+          }
+        } catch (error) {
+          console.warn('Error performing detailed search for competitor:', error);
+        }
+      }
+
+      // If we have a maps URL, enrich it by opening maps and scraping
+      if (topCompetitor?.url?.includes('google.com/maps')) {
+        try {
+          console.log(`Enriching with maps details for: ${topCompetitor.title}`);
+          await randomDelay(1000, 2000);
+          const details = await scrapeMapsPlace(page, topCompetitor.url);
+          if (details) {
+            // Only update fields that aren't already set from the detailed search
+            competitorDetails = {
+              ...competitorDetails,
+              ...Object.fromEntries(
+                Object.entries(details).filter(([_, v]) => v && v !== 'N/A' && v !== '0' && v !== 0 && v !== false)
+              ),
+              // Preserve the original URL and any other important fields
+              mapsUrl: competitorDetails.mapsUrl || topCompetitor.url,
+              website: competitorDetails.website || details.website || 'N/A'
+            };
+          }
+        } catch (e) {
+          console.warn('Failed to enrich maps details:', (e as Error).message);
+        }
+      }
+
+      const resultRow: RankingRow = {
+        keyword: kw.keyword,
+        yourRanking: ourRank > 0 ? String(ourRank) : 'Not Ranked in Top 20',
+        topCompetitor: topCompetitor?.title || 'N/A',
+        theirRank: topCompetitor ? String(competitorRank) : 'N/A',
+        competitorDetails,
+        rating: competitorDetails.rating,
+        reviews: competitorDetails.reviews,
+        category: competitorDetails.category,
+        address: competitorDetails.address,
+        phone: competitorDetails.phone,
+        website: competitorDetails.website,
+        mapsUrl: competitorDetails.mapsUrl,
+        lastUpdated: new Date().toISOString()
+      };
+
+      // console.log(`Processed keyword: ${kw.keyword}`);
+      // console.log(JSON.stringify(resultRow, null, 2));
+      results.push(resultRow);
+
+      // Reduced human-like delay between keywords to speed up the run while keeping some randomness
+      await randomDelay(7000, 14000);
+    }
+  } finally {
+    await browser.close();
+  }
+
+  return results;
+}
+
+function printTable(rows: RankingRow[]) {
+  console.log('\nCurrent Keyword Rankings\n');
+  console.table(
+    rows.map(r => ({
+      Keyword: r.keyword,
+      'My Rank': r.yourRanking,
+      Competitor: r.topCompetitor,
+      'Competitor Rank': r.theirRank
+    }))
+  );
+  // console.log('\nJSON Result:\n', JSON.stringify(rows, null, 2));
+}
+
+function printCompetitorTable(rows: RankingRow[]) {
+  console.log('\nCompetitor Analysis Table\n');
+  
+  // Get unique competitors by name to avoid duplicates
+  const competitors = new Map<string, {name: string, details: CompetitorDetails}>();
+  
+  rows.forEach(row => {
+    if (row.competitorDetails) {
+      // Use business name as the primary identifier
+      const cleanName = row.topCompetitor.split('|')[0].trim();
+      
+      // If we have a mapsUrl, use it as part of the key to handle different locations with same name
+      const identifier = row.competitorDetails.mapsUrl && row.competitorDetails.mapsUrl !== 'N/A' 
+        ? `${cleanName}::${row.competitorDetails.mapsUrl}` 
+        : cleanName;
+      
+      // Set hasDirections based on address
+      const hasMapIt = (row.competitorDetails.address || '').toLowerCase().includes('map it');
+      row.competitorDetails.hasDirections = hasMapIt || (!!row.competitorDetails.address && row.competitorDetails.address !== 'Map it');
+      
+      // Extract review count from category if available
+      const category = row.competitorDetails.category || '';
+      const reviewMatch = category.match(/\((\d+)\)/);
+      if (reviewMatch && reviewMatch[1]) {
+        row.competitorDetails.reviewCount = reviewMatch[1];
+      }
+      
+      if (!competitors.has(identifier)) {
+        competitors.set(identifier, {
+          name: cleanName,
+          details: row.competitorDetails
+        });
+      }
+    }
+  });
+
+  // Create table data with cleaner formatting
+  const tableData = Array.from(competitors.values()).map(({name, details}) => {
+    // Ensure button detection fields exist
+    if (!details.websiteBtn) details.websiteBtn = 'No';
+    if (!details.scheduleBtn) details.scheduleBtn = 'No';
+    if (!details.callBtn) details.callBtn = 'No';
+    // Clean up the rating
+    let rating = 'N/A';
+    const ratingMatch = (details.rating || '').match(/([0-9.]+)/);
+    if (ratingMatch) {
+      rating = parseFloat(ratingMatch[1]).toFixed(1);
+    }
+    
+    // Get review count - support K/M and comma numbers
+    const toCount = (s?: string) => {
+      const v = (s || '').trim();
+      const km = v.match(/^([0-9]+(?:\.[0-9]+)?)\s*([kKmM])$/);
+      if (km) {
+        const n = parseFloat(km[1]);
+        return String(Math.round(n * (km[2].toLowerCase() === 'm' ? 1_000_000 : 1_000)));
+      }
+      const num = v.match(/[0-9][0-9,]*/);
+      if (num) return num[0].replace(/,/g, '');
+      return '0';
+    };
+    let reviews = '0';
+    if (details.reviewCount) {
+      reviews = toCount(details.reviewCount);
+    } else {
+      const paren = (details.category || '').match(/\(([^)]+)\)/)?.[1];
+      reviews = toCount(paren);
+    }
+    
+    // Clean up address - handle 'Map it' case
+    let address = (details.address || '').replace(/\n/g, ', ').replace(/\s+/g, ' ').trim();
+    if (address.toLowerCase() === 'map it') {
+      address = 'Map available';
+    }
+    
+    // Clean up category - remove rating and other metadata
+    let category = (details.category || '').split('·')[0].trim();
+    category = category.replace(/\d+\.?\d*\s*★?\s*\(\d+\)/, '').trim();
+    
+    // Determine if directions are available
+    const hasDirections = details.hasDirections || (details.address && details.address.toLowerCase().includes('map it'));
+    
+    // Get posts count (default to 0 if not available)
+    const posts = details.posts || '0';
+    
+    // Button flags renamed for display
+    const websiteBtn = details.websiteBtn || 'No';
+    const scheduleBtn = details.scheduleBtn || 'No';
+    const callBtn = details.callBtn || 'No';
+    
+    return {
+      'Competitor': name,
+      'Rating': rating,
+      'Reviews': reviews,
+      'Website': websiteBtn,
+      'Scehule': scheduleBtn,
+      'Call': callBtn,
+      'Posts': posts,
+      'Directions': hasDirections ? 'Yes' : 'No',
+      'Phone': details.phone && details.phone !== 'N/A' ? details.phone : 'N/A',
+      'Category': category || 'N/A',
+      'Address': address.substring(0, 30) + (address.length > 30 ? '...' : '')
+    };
+  });
+
+  // Sort by number of reviews (descending)
+  tableData.sort((a, b) => {
+    const aReviews = parseInt(a['Reviews'] || '0');
+    const bReviews = parseInt(b['Reviews'] || '0');
+    return bReviews - aReviews;
+  });
+
+  // Display only the most important columns in the table
+  const displayColumns = [
+    'Competitor', 
+    'Rating', 
+    'Reviews', 
+    'Website',
+    'Scehule',
+    'Call',
+    'Posts', 
+    'Directions',
+    'Phone'
+  ];
+  const filteredTableData = tableData.map(entry => {
+    const filtered: Record<string, any> = {};
+    displayColumns.forEach(col => {
+      filtered[col] = entry[col as keyof typeof entry];
+    });
+    return filtered;
+  });
+
+  console.table(filteredTableData);
+  
+  // Detailed view for each competitor
+  // console.log('\nDetailed Competitor Information:\n');
+  // tableData.forEach((competitor, index) => {
+  //   console.log(`\n${index + 1}. ${competitor.Competitor}`);
+  //   console.log('─'.repeat(competitor.Competitor.length + 4));
+  //   console.log(`⭐ Rating: ${competitor.Rating} (${competitor.Reviews} reviews)`);
+  //   console.log(`📱 Phone: ${competitor.Phone || '❌ Not Available'}`);
+  //   console.log(`🌐 Website: ${competitor.Website === 'Yes' ? '✅ Available' : '❌ Not Available'}`);
+  //   console.log(`📅 Schedule: ${competitor.Scehule === 'Yes' ? '✅ Available' : '❌ Not Available'}`);
+  //   console.log(`📞 Call: ${competitor.Call === 'Yes' ? '✅ Available' : '❌ Not Available'}`);
+  //   console.log(`🧭 Directions: ${competitor.Directions === 'Yes' ? '✅ Available' : '❌ Not Available'}`);
+  //   console.log(`📝 Posts: ${competitor.Posts || '0'}`);
+  //   console.log(`📍 Address: ${competitor.Address || 'Not available'}`);
+  //   console.log(`🏷️  Category: ${competitor.Category || 'N/A'}`);
+  // });
+}
+
+async function main() {
+  const args = parseArgs();
+  if (!args.gmbUrl) {
+    console.error('Usage: node gmbrankingscrapping.ts --gmbUrl="https://maps.app.goo.gl/..."');
+    process.exit(1);
+  }
+
+  console.log('Starting GMB Scraper (stealth mode)...');
+  console.log('GMB URL:', args.gmbUrl);
+
+  const { business, city, keywords } = await generateKeywordIdeas(args.gmbUrl);
+
+  if (!business || !keywords || keywords.length === 0) {
+    console.error('Missing business or keywords — aborting.');
+    process.exit(1);
+  }
+
+  console.log(`Business: ${business}`);
+  console.log(`City: ${city}`);
+  console.log('Keywords:');
+  keywords.forEach((k, i) => console.log(`  ${i + 1}. ${k.keyword} -> ${k.query}`));
+
+  console.log('\nGenerating rankings...');
+  const rankings = await generateScrapedRankings(keywords, business, city);
+  
+  // Print the main rankings table
+  printTable(rankings);
+  
+  // Print the detailed competitor analysis table
+  if (rankings.length > 0) {
+    printCompetitorTable(rankings);
+  }
+
+  // Save to file if needed
+  // fs.writeFileSync('rankings.json', JSON.stringify(rankings, null, 2));
+  // console.log('\nResults saved to rankings.json');
+}
+
+main().catch(e => {
+  console.error('Unexpected error:', e);
+  process.exit(1);
+});
