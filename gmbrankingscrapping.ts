@@ -31,6 +31,158 @@ export interface KeywordIdea {
   query: string;
 }
 
+// Fetch my business details by searching Google (RHS panel), not opening Maps directly
+async function fetchMyBusinessDetailsFromGoogle(business: string, city: string) {
+  const query = `${business} ${city}`.trim();
+  const userDataDir = process.env.USER_DATA_DIR || path.resolve(process.cwd(), '.puppeteer_profile');
+  try { fs.mkdirSync(userDataDir, { recursive: true }); } catch {}
+
+  const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?: string } = {
+    headless: false,
+    ignoreHTTPSErrors: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--window-size=1366,900',
+    ],
+    defaultViewport: {
+      width: 1280 + Math.floor(Math.random() * 160),
+      height: 768 + Math.floor(Math.random() * 200),
+      deviceScaleFactor: 1,
+      hasTouch: false,
+      isLandscape: false,
+    },
+    userDataDir,
+  };
+
+  const browser = await puppeteer.launch(launchOptions) as Browser;
+  const page = await browser.newPage();
+  try {
+    const ok = await performHumanSearch(page, query);
+    if (!ok) throw new Error('Google search navigation failed');
+    // local short delay (do not depend on randomDelay which is declared later)
+    await new Promise(r => setTimeout(r, 1000 + Math.floor(Math.random() * 700)));
+
+    // Wait a bit for RHS action buttons (Website/Directions/Reviews) to render
+    try {
+      await page.waitForFunction(() => {
+        const scope: Document | Element = document;
+        const cand = Array.from(scope.querySelectorAll('#rhs a, #rhs button, #rhs [role="link"], a, button, [role="link"]')) as HTMLElement[];
+        const anyAction = cand.some(el => {
+          const t = (el.getAttribute('aria-label') || el.textContent || '').toLowerCase();
+          const href = ((el as HTMLAnchorElement).href || '').toLowerCase();
+          const attrid = (el.getAttribute('data-attrid') || '').toLowerCase();
+          return t.includes('website') || t.includes('directions') || href.includes('/maps/dir/') || attrid.includes('direction');
+        });
+        const dirSpan = Array.from(scope.querySelectorAll('#rhs .PbOY2e, .PbOY2e')).some(el => (/\bdirections\b/i.test(el.textContent || '')));
+        return anyAction || dirSpan;
+      }, { timeout: 5000 });
+    } catch {}
+
+    // Extract RHS knowledge panel with robust fallbacks (subset of scrapeGoogleSearch RHS logic)
+    const rhs = await page.evaluate(() => {
+      const get = (sel: string) => (document.querySelector(sel) as HTMLElement | null);
+      const getAll = (sel: string) => Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+      const text = (el: Element | null) => (el?.textContent || '').trim();
+      const attr = (el: Element | null, a: string) => (el && (el as HTMLElement).getAttribute?.(a)) || '';
+
+      // try standard RHS container selectors
+      const rhsRoot = get('#rhs') || get('[data-attrid="title"]')?.closest('#rhs') as HTMLElement || (get('#rhs') as HTMLElement);
+      const root = rhsRoot || document;
+
+      const out: any = {};
+      // Name
+      out.name = text(root.querySelector('#rhs h2') || root.querySelector('#rhs h3') || root.querySelector('[data-attrid="title"]') || root.querySelector('h2[data-attrid]'));
+      if (!out.name) {
+        const cand = root.querySelector('#rhs .SPZz6b, #rhs .qrShPb, #rhs [role="heading"]');
+        out.name = text(cand);
+      }
+      // Rating & reviews
+      const ratingEl = root.querySelector('[aria-label*="stars" i], [aria-label*="rating" i], .Aq14fc') as HTMLElement | null;
+      out.averageRating = text(ratingEl).replace(/[^0-9.]/g, '') || text(ratingEl);
+      // Prefer link that says "Google reviews"; fallback to any reviews link and extract digits
+      const reviewCandidates = Array.from(root.querySelectorAll('#rhs a, #rhs span, a, span')) as HTMLElement[];
+      const reviewNode = reviewCandidates.find(el => /google\s+reviews/i.test(el.textContent || ''))
+        || reviewCandidates.find(el => /reviews?/i.test(el.textContent || ''));
+      out.reviewCount = reviewNode ? (reviewNode.textContent || '').replace(/[^0-9,]/g, '') : '';
+      // Category
+      out.category = text(root.querySelector('[data-attrid="subtitle"]'));
+      // Address / Phone
+      out.address = text(root.querySelector('[data-attrid*="address" i], [data-attrid="kc:/location/location:address"]'));
+      const phoneEl = root.querySelector('a[href^="tel:"], span[aria-label*="Phone"], [data-attrid*="phone"]') as HTMLElement | null;
+      out.phone = (attr(phoneEl, 'href') || '').replace(/^tel:/, '') || text(phoneEl);
+      // Website button (robust: look for visible link/button with text)
+      const actionNodes = Array.from(root.querySelectorAll('#rhs a, #rhs button, #rhs [role="link"], a, button, [role="link"]')) as HTMLElement[];
+      const siteEl = actionNodes.find(el => /website/i.test((el.getAttribute('aria-label') || el.textContent || '')));
+      const siteHref = (siteEl as HTMLAnchorElement)?.href || '';
+      out.website = siteHref;
+      out.websiteBtn = siteEl ? 'Yes' : 'No';
+      // Directions button (robust)
+      let dirEl = actionNodes.find(el => {
+        const label = (el.getAttribute('aria-label') || el.textContent || '').toLowerCase();
+        const href = ((el as HTMLAnchorElement).href || '').toLowerCase();
+        const attrid = (el.getAttribute('data-attrid') || '').toLowerCase();
+        // Accept variants: Directions, Get directions, data-attrid contains direction, direct maps dir links
+        return label.includes('direction') || href.includes('/maps/dir/') || attrid.includes('direction');
+      })
+      || root.querySelector('a[aria-label*="Direction" i], [data-attrid*="direction" i]')
+      || Array.from(root.querySelectorAll('#rhs a, #rhs button, #rhs [role="link"], a, button, [role="link"]')).find((el: any) => (el.innerText || '').trim().toLowerCase() === 'directions');
+      if (!dirEl) {
+        // Look for the span label used by Google buttons, then bubble up to clickable container
+        const span = root.querySelector('span.PbOY2e');
+        if (span && /\bdirections\b/i.test(span.textContent || '')) {
+          const action = (span.closest('[role="link"]') as HTMLElement) || (span.parentElement as HTMLElement);
+          if (action) dirEl = action as any;
+        }
+      }
+      if (!dirEl) {
+        // Match Google's local action container variant
+        const localActions = Array.from(root.querySelectorAll('div.bkaPDb[jsname="UXbvIb"], [ssk*="local_action"], [jsname="UXbvIb"]')) as HTMLElement[];
+        for (const la of localActions) {
+          const lbl = (la.querySelector('.PbOY2e') as HTMLElement | null)?.textContent || '';
+          if (/\bdirections\b/i.test(lbl)) { dirEl = la; break; }
+        }
+      }
+      out.hasDirections = !!dirEl;
+      // Schedule button (appointment)
+      const schedEl = root.querySelector('a[aria-label*="Schedule" i], a[data-attrid*="appointment" i], a[aria-label*="Book"]') as HTMLElement | null;
+      out.scheduleAvailable = !!schedEl;
+      out.scheduleBtn = out.scheduleAvailable ? 'Yes' : 'No';
+      // Call button
+      const callEl = root.querySelector('a[href^="tel:"], a[aria-label^="Call" i], button[aria-label^="Call" i]') as HTMLElement | null;
+      out.callAvailable = !!callEl; out.callBtn = out.callAvailable ? 'Yes' : 'No';
+      // Posts (heuristic)
+      const posts = getAll('#rhs a[href*="posts"], #rhs a[href*="/posts"], #rhs [data-attrid*="posts"]');
+      out.posts = String(posts.length || 0);
+      return out;
+    });
+
+    // Clean common prefixes Google may include in text
+    const clean = (s: any) => String(s || '').replace(/^\s*(Address:|Phone:|Website:)\s*/i, '').trim() || 'N/A';
+    console.log('\nMy Business Details (from Google RHS)');
+    console.log(`- Name: ${clean(rhs?.name || business)}`);
+    console.log(`- Rating: ${clean(rhs?.averageRating)}`);
+    console.log(`- Reviews: ${clean(rhs?.reviewCount)}`);
+    console.log(`- Category: ${clean(rhs?.category)}`);
+    console.log(`- Address: ${clean(rhs?.address)}`);
+    console.log(`- Phone: ${clean(rhs?.phone)}`);
+    // Show presence + URL separately for clarity
+    console.log(`- Website: ${(rhs?.website ? 'Yes' : 'No')}`);
+    console.log(`- Website URL: ${clean(rhs?.website)}`);
+    console.log(`- Schedule: ${(rhs?.scheduleAvailable ? 'Yes' : 'No')}`);
+    console.log(`- Call: ${(rhs?.callAvailable ? 'Yes' : 'No')}`);
+    console.log(`- Directions: ${(rhs?.hasDirections ? 'Yes' : 'No')}`);
+    console.log(`- Posts: ${clean(rhs?.posts || '0')}`);
+  } catch (e) {
+    console.warn('Failed to fetch my business details from Google:', (e as Error).message);
+  } finally {
+    try { await page.close(); } catch {}
+    try { await browser.close(); } catch {}
+  }
+}
+
 let __hasWarmedUp = false;
 
 // Type text like a person
@@ -2459,6 +2611,9 @@ async function main() {
   console.log(`City: ${city}`);
   console.log('Keywords:');
   keywords.forEach((k, i) => console.log(`  ${i + 1}. ${k.keyword} -> ${k.query}`));
+
+  // Fetch and display my business details from Google RHS based on detected business & city
+  await fetchMyBusinessDetailsFromGoogle(business, city);
 
   console.log('\nGenerating rankings...');
   const rankings = await generateScrapedRankings(keywords, business, city);
