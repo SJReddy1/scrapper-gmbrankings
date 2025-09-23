@@ -200,10 +200,10 @@ function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: stri
     const n = parseInt(String(d.reviews || d.reviewCount || '0').replace(/[^0-9]/g, '')) || 0;
     if (n > 0) compReviews.push(n);
   });
-  const compAvgReviews = compReviews.length ? Math.round(compReviews.reduce((a,b)=>a+b,0)/compReviews.length) : 0;
-  let authority = 'Unclear';
-  if (compAvgReviews >= 500) authority = 'Strong';
-  else if (compAvgReviews >= 150) authority = 'Moderate';
+  // const compAvgReviews = compReviews.length ? Math.round(compReviews.reduce((a,b)=>a+b,0)/compReviews.length) : 0;
+  // let authority = 'Unclear';
+  // if (compAvgReviews >= 500) authority = 'Strong';
+  // else if (compAvgReviews >= 150) authority = 'Moderate';
 
   // Build unique competitor table (merge best-available fields)
   const compMap = new Map<string, any>();
@@ -331,11 +331,12 @@ function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: stri
 
       <h2 class="section">Snapshot</h2>
       <div class="snapshot">
-        <div class="card"><h4>Reviews</h4><div class="value">${esc(biz.reviewCount || 'NA')} ${biz.averageRating && biz.averageRating !== 'N/A' ? `(Avg — ${esc(biz.averageRating)})` : ''}</div></div>
+        <div class="card"><h4>Rating</h4><div class="value">${esc(biz.averageRating || 'N/A')}</div></div>
+        <div class="card"><h4>Reviews</h4><div class="value">${esc(biz.reviewCount || 'N/A')}</div></div>
         <div class="card"><h4>Website</h4><div class="value">${biz.website ? 'Yes' : 'No'}</div></div>
-        <div class="card"><h4>Directions / Call</h4><div class="value">${yesNo(biz.hasDirections)} / ${yesNo(biz.callAvailable)}</div></div>
+        <div class="card"><h4>Directions</h4><div class="value">${yesNo(biz.hasDirections)}</div></div>
+        <div class="card"><h4>Call</h4><div class="value">${yesNo(biz.callAvailable)}</div></div>
         <div class="card"><h4>“Schedule Now” on GMB</h4><div class="value">${yesNo(biz.scheduleAvailable)}</div></div>
-        <div class="card"><h4>Profile Authority</h4><div class="value">${authority}</div><div class="note">Top competitors avg ${compAvgReviews.toLocaleString()} reviews</div></div>
       </div>
 
       <h2 class="section">Current Keyword Rankings</h2>
@@ -590,11 +591,28 @@ const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?
       if (!visited) throw new Error('Failed to open Maps URL');
       try { await (page as any).solveRecaptchas?.(); } catch {}
       const maps = await scrapeMapsPlace(page, mapsUrl);
-      const cleanVal = (s: any) => String(s || '').trim() || 'N/A';
+      const cleanVal = (s: any) => {
+        const v = String(s ?? '').trim();
+        if (!v || v === 'N/A' || v === '0' || v === '0.0') return '';
+        return v;
+      };
+      const firstNonEmpty = (...vals: any[]) => vals.map(cleanVal).find(v => v !== undefined && v !== null && v !== '');
+      const parsedAvg = (() => {
+        const r = firstNonEmpty(maps.averageRating, maps.rating);
+        if (!r) return '';
+        const m = String(r).match(/(\d+(?:\.\d+)?)/);
+        return m ? m[1] : r;
+      })();
+      const parsedReviews = (() => {
+        const rv = firstNonEmpty(maps.reviewCount, maps.reviews);
+        if (!rv) return '';
+        const m = String(rv).match(/(\d[\d,]*\+?k?)/i);
+        return m ? m[1].replace(/,/g,'') : rv;
+      })();
       console.log('\nMy Business Details (from Google Maps LHS)');
       console.log(`- Name: ${cleanVal(maps.name || business)}`);
-      console.log(`- Rating: ${cleanVal(maps.averageRating || maps.rating)}`);
-      console.log(`- Reviews: ${cleanVal(maps.reviewCount || maps.reviews)}`);
+      console.log(`- Rating: ${parsedAvg || 'N/A'}`);
+      console.log(`- Reviews: ${parsedReviews || 'N/A'}`);
       console.log(`- Category: ${cleanVal(maps.category)}`);
       console.log(`- Address: ${cleanVal(maps.address)}`);
       console.log(`- Phone: ${cleanVal(maps.phone)}`);
@@ -603,12 +621,12 @@ const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?
       console.log(`- Schedule: ${maps.scheduleAvailable ? 'Yes' : 'No'}`);
       console.log(`- Call: ${maps.callAvailable ? 'Yes' : 'No'}`);
       console.log(`- Directions: ${maps.hasDirections ? 'Yes' : 'No'}`);
-      console.log(`- Posts: ${cleanVal(maps.posts || '0')}`);
+      // Posts removed from output by request
       try { await browser.close(); } catch {}
       return {
-        name: cleanVal(maps.name || business),
-        averageRating: cleanVal(maps.averageRating || maps.rating),
-        reviewCount: cleanVal(maps.reviewCount || maps.reviews),
+        name: cleanVal(maps.name || business) || (maps.name || business),
+        averageRating: parsedAvg || 'N/A',
+        reviewCount: parsedReviews || 'N/A',
         category: cleanVal(maps.category),
         address: cleanVal(maps.address),
         phone: cleanVal(maps.phone),
@@ -2125,7 +2143,7 @@ async function scrapeMapsPlace(page: Page, placeUrl: string) {
         const el = document.querySelector(sel) as HTMLElement | null;
         return el?.textContent?.trim() || '';
       };
-      const has = (sel: string) => document.querySelector(sel) !== null;
+      //const has = (sel: string) => document.querySelector(sel) !== null;
 
       // Name
       out.name = t('h1') || t('[data-testid="title"]') || t('.x3AX1-LfntMc-header-title') || t('.section-hero-header-title');
@@ -2177,6 +2195,14 @@ async function scrapeMapsPlace(page: Page, placeUrl: string) {
           header.querySelector('[jslog], [aria-live]')?.parentElement,
           header
         ].filter(Boolean) as Element[];
+        // Direct rating number from aria-hidden within rating cluster (e.g., .F7nice)
+        try {
+          const cluster = header.querySelector('.F7nice') || header;
+          const ah = cluster.querySelector('span[aria-hidden="true"]');
+          const txt = (ah?.textContent || '').trim();
+          const m = txt.match(/\d+(?:\.\d+)?/);
+          if (m && !out.averageRating) out.averageRating = m[0];
+        } catch {}
         containers.forEach(el => {
           const txt = toPlain(el.textContent || '');
           if (txt) candidates.push(txt);
@@ -2197,6 +2223,21 @@ async function scrapeMapsPlace(page: Page, placeUrl: string) {
       // If we have averageRating but no friendly rating string, compose it
       if (out.averageRating && !out.rating) {
         out.rating = `Rated ${out.averageRating} out of 5`;
+      }
+      // If we only have rating string, attempt to backfill averageRating
+      if (!out.averageRating && out.rating) {
+        const m = String(out.rating).match(/(\d+(?:\.\d+)?)/);
+        if (m) out.averageRating = m[1];
+      }
+
+      // Additional fallback: parse any explicit reviews link/button
+      if (!out.reviewCount) {
+        const reviewsEl = document.querySelector('a[href*="review" i], a[aria-label*="review" i], button[aria-label*="review" i]');
+        if (reviewsEl) {
+          const txt = toPlain((reviewsEl.textContent || (reviewsEl as HTMLElement).getAttribute('aria-label') || ''));
+          const rc = pickReviewCount(txt);
+          if (rc) { out.reviewCount = rc; out.reviews = rc; }
+        }
       }
 
       // Utilities
@@ -2389,7 +2430,17 @@ async function scrapeMapsPlace(page: Page, placeUrl: string) {
           'a[aria-label*="Direction" i]',
           'button[aria-label*="Direction" i]'
         ]);
-        out.hasDirections = !!dirEl || has('button[aria-label*="direction" i], a[aria-label*="direction" i], button:has-text("Directions"), a[href*="/dir/"]');
+        // Fallback: scan buttons/links for visible "Directions" text or aria-label
+        const hasDir = (() => {
+          const nodes = Array.from(document.querySelectorAll('button, a')) as HTMLElement[];
+          return nodes.some(n => {
+            const txt = (n.textContent || '').toLowerCase();
+            const aria = (n.getAttribute('aria-label') || '').toLowerCase();
+            const href = (n as HTMLAnchorElement).getAttribute?.('href') || '';
+            return txt.includes('directions') || aria.includes('direction') || (href && href.includes('/dir/'));
+          });
+        })();
+        out.hasDirections = !!dirEl || hasDir;
       }
 
       // ---- Text-based fallbacks using span.PbOY2e from user's DOM snippet ----
@@ -2503,9 +2554,14 @@ async function scrapeMapsPlace(page: Page, placeUrl: string) {
         const txt = el.textContent || '';
         return /review(s)?|ratings?/i.test(txt);
       });
-      out.reviews = reviewsBtn?.textContent?.trim() || '';
-      const revMatch = out.reviews.match(/\d[\d,]*/);
-      out.reviews = revMatch ? revMatch[0] : (out.reviews || '');
+      if (reviewsBtn) {
+        const text = reviewsBtn.textContent?.trim() || '';
+        const revMatch = text.match(/\d[\d,]*/);
+        if (revMatch) {
+          out.reviews = revMatch[0];
+          if (!out.reviewCount) out.reviewCount = revMatch[0].replace(/,/g,'');
+        }
+      }
 
       // Address - many selectors
       out.address =
@@ -2560,6 +2616,19 @@ async function scrapeMapsPlace(page: Page, placeUrl: string) {
     if (details) {
       result.rating = details.rating || result.rating;
       result.reviews = details.reviews || result.reviews;
+      // Explicitly carry numeric rating and count
+      if (details.averageRating) {
+        result.averageRating = details.averageRating;
+      } else if (!result.averageRating && result.rating) {
+        const m = String(result.rating).match(/(\d+(?:\.\d+)?)/);
+        if (m) result.averageRating = m[1];
+      }
+      if (details.reviewCount) {
+        result.reviewCount = details.reviewCount;
+      } else if (!result.reviewCount && details.reviews) {
+        const m = String(details.reviews).match(/(\d[\d,]*\+?k?)/i);
+        if (m) result.reviewCount = m[1].replace(/,/g,'');
+      }
       result.address = (details.address || result.address).replace(/\n+/g, ', ').trim();
       result.phone = details.phone || result.phone;
       result.website = details.website || result.website;
