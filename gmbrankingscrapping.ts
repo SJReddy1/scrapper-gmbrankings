@@ -460,14 +460,91 @@ function buildNarrativePrompt(biz: MyBizDetails, rows: RankingRow[], city: strin
     compReviews: (r.competitorDetails?.reviews || r.reviews || ''),
     compRating: (r.competitorDetails?.rating || r.rating || ''),
   }));
-  return `You are a GMB analyst. Using the JSON below, write a concise, client-facing narrative in HTML fragment form (no <html> or <body>). Include:
-  - Profile overview in 2-3 short paragraphs.
-  - Key findings from keyword rankings and competitor benchmarking.
-  - 6-10 specific recommendations (bulleted) covering SEO, reviews, content, website fixes, GMB buttons, and positioning.
-  Keep it professional and clear.
 
-  Base Profile Summary JSON: ${JSON.stringify(summary)}
-  Keyword Rows JSON: ${JSON.stringify(compactRows)}
+  // Compute simple competitor stats to guide star ratings and priorities
+  const parseNum = (s: any) => {
+    const m = String(s ?? '').match(/\d+(?:\.\d+)?/);
+    return m ? parseFloat(m[0].replace(/,/g, '')) : 0;
+  };
+  const compReviewNums = compactRows.map(r => parseNum(r.compReviews)).filter(n => n > 0);
+  const compRatingNums = compactRows.map(r => parseNum(r.compRating)).filter(n => n > 0);
+  const stats = {
+    compAvgReviews: compReviewNums.length ? Math.round(compReviewNums.reduce((a,b)=>a+b,0)/compReviewNums.length) : 0,
+    compMaxReviews: compReviewNums.length ? Math.max(...compReviewNums) : 0,
+    compAvgRating: compRatingNums.length ? (compRatingNums.reduce((a,b)=>a+b,0)/compRatingNums.length).toFixed(1) : '0.0',
+  };
+
+  // Roadmap-style, star-rated instructions without hardcoded rows
+  return `ROLE: You are a senior GMB (Google My Business) consultant creating post-table insights for a client-facing PDF report.
+
+STRICT OUTPUT FORMAT: Return ONLY an HTML FRAGMENT (no <html>, <head>, <body>, or markdown). Do NOT wrap in code fences. Use semantic headings and lists. Keep copy professional and concise.
+
+DERIVE ACTIONS FROM DATA: Use the inputs to infer gaps and priorities. Examples:
+- If schedule=false then recommend enabling “Schedule Now” (High, ★★★★★).
+- If call=false then add Call button (High, ★★★★☆).
+- If reviews << compAvgReviews or compMaxReviews, push review program (High, ★★★★★) with targets.
+- If avgRating < compAvgRating, include rating improvement plan (High/Medium based on gap).
+- If website=false, add website fix (High, ★★★★☆). If true but weak content (infer from rankings), recommend content/posts.
+- Use keyword ranks to target weak areas (yourRank worse than competitor) in plan and recommendations.
+
+SECTIONS TO OUTPUT (in this order):
+
+<h2 class="section">Keyword Gap & Action Insights</h2>
+<div class="card">
+  <ul>
+    <!-- 6-10 bullets derived from inputs (no placeholders). Use labels like <strong>Authority Gap:</strong>, <strong>Conversion Weakness:</strong>, <strong>Missed Services:</strong>. -->
+  </ul>
+  <div class="note">Base profile vs competitor gaps are inferred from the data; keep each point actionable.</div>
+</div>
+
+<h2 class="section">90-Day Strategic Growth Plan</h2>
+<div class="card">
+  <h4>Month 1: Profile & Trust Setup</h4>
+  <ul>
+    <!-- Include actions like enabling Schedule/Call, review ask flow with target counts, fixing website basics, and 3 posts/week if needed. Use icons ✅ ⚡ 🚀 appropriately. -->
+  </ul>
+  <h4>Month 2: Local Authority Building</h4>
+  <ul>
+    <!-- Include review milestones, content cadence, bilingual posts if relevant, category/service updates. -->
+  </ul>
+  <h4>Month 3: Lead Generation & Ads</h4>
+  <ul>
+    <!-- Include small-budget local ads, tracking, and keyword-driven posting to lift weak areas. -->
+  </ul>
+</div>
+
+<h2 class="section">Final Recommendations</h2>
+<table>
+  <thead>
+    <tr><th>Priority</th><th>Action</th><th>Impact</th></tr>
+  </thead>
+  <tbody>
+    <!-- Populate 5-8 actions dynamically from inputs. Group by High/Medium/Low. Use unicode stars (e.g., ★★★★★, ★★★★☆). No hardcoded items. -->
+  </tbody>
+</table>
+
+<h2 class="section">Connect With Us</h2>
+<div class="card">
+  <div class="note">
+    Expert: (Your Consultant Name)<br/>
+    Phone: +91-XXXXXXXXXX<br/>
+    Email: your.email@example.com<br/>
+    Visit: yoursite.example
+  </div>
+</div>
+
+INPUTS:
+- Base Profile Summary JSON: ${JSON.stringify(summary)}
+- Keyword Rows JSON: ${JSON.stringify(compactRows)}
+- Computed Competitor Stats: ${JSON.stringify(stats)}
+
+GUIDELINES:
+- Reference inputs implicitly (no raw JSON in output).
+- Avoid placeholders like “Lorem ipsum”.
+- Do not include markdown or code fences.
+- Use ✅ ⚡ 🚀 icons in Month tasks where appropriate.
+- Derive star ratings and priority from gaps indicated by inputs and stats.
+- Keep to concise, client-friendly language suitable for PDF export.
 `;
 }
 
