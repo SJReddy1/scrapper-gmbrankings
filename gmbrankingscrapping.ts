@@ -440,7 +440,12 @@ Make it professional, analytical, and visually structured for a client-facing re
 }
 
 // Build a short narrative prompt for AI to return only HTML paragraphs and bullet lists (no full HTML shell)
-function buildNarrativePrompt(biz: MyBizDetails, rows: RankingRow[], city: string): string {
+function buildNarrativePrompt(
+  biz: MyBizDetails,
+  rows: RankingRow[],
+  city: string,
+  expert?: { name?: string; phone?: string; email?: string }
+): string {
   const summary = {
     name: biz.name,
     city,
@@ -526,10 +531,11 @@ SECTIONS TO OUTPUT (in this order):
 <h2 class="section">Connect With Us</h2>
 <div class="card">
   <div class="note">
-    Expert: (Your Consultant Name)<br/>
-    Phone: +91-XXXXXXXXXX<br/>
-    Email: your.email@example.com<br/>
-    Visit: yoursite.example
+    <!-- Use provided Expert JSON if available; otherwise keep this section minimal. -->
+    <!-- Render fields that exist; avoid placeholders. -->
+    ${expert?.name ? `Expert: ${expert.name}<br/>` : ''}
+    ${expert?.phone ? `Phone: ${expert.phone}<br/>` : ''}
+    ${expert?.email ? `Email: ${expert.email}<br/>` : ''}
   </div>
 </div>
 
@@ -537,6 +543,7 @@ INPUTS:
 - Base Profile Summary JSON: ${JSON.stringify(summary)}
 - Keyword Rows JSON: ${JSON.stringify(compactRows)}
 - Computed Competitor Stats: ${JSON.stringify(stats)}
+${expert ? `- Expert JSON: ${JSON.stringify(expert)}` : ''}
 
 GUIDELINES:
 - Reference inputs implicitly (no raw JSON in output).
