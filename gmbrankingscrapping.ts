@@ -27,7 +27,6 @@ import { Browser, Page, LaunchOptions, ElementHandle } from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
 import getAiGeneratedText from '../services/generativeAI';
-import { execFile } from 'child_process';
 
 // Enable stealth plugin with enhanced configuration
 puppeteer.use(StealthPlugin());
@@ -71,6 +70,11 @@ const STEALTH_CONFIG = {
   LANGUAGES: ['en-IN', 'en-US', 'en-GB'],
   TIMEZONES: ['Asia/Kolkata', 'Asia/Mumbai', 'Asia/Delhi', 'Asia/Bangalore']
 };
+
+const DEFAULT_PUPPETEER_EXECUTABLE_PATH =
+  process.env.PUPPETEER_EXECUTABLE_PATH ||
+  process.env.CHROME_PATH ||
+  '/usr/bin/google-chrome-stable';
 
 // Unified CAPTCHA handling across reCAPTCHA (checkbox/image) and text captcha pages
 async function tryHandleCaptcha(page: Page): Promise<boolean> {
@@ -221,7 +225,6 @@ function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: stri
           reviews: d.reviews || r.reviews,
           website: d.website || r.website,
           hasDirections: typeof d.hasDirections === 'boolean' ? d.hasDirections : false,
-          posts: d.posts || '0',
           scheduleAvailable: typeof d.scheduleAvailable === 'boolean' ? d.scheduleAvailable : (d.scheduleBtn === 'Yes'),
           callAvailable: typeof d.callAvailable === 'boolean' ? d.callAvailable : (d.callBtn === 'Yes'),
         }
@@ -248,9 +251,22 @@ function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: stri
     return '';
   };
 
+  // Ensure keywords in the table are city-specific, e.g., "dentist in Bhopal"
+  // Only append if the keyword does not already contain the current city name.
+  const addCityToKeyword = (k: any) => {
+    const ks = String(k ?? '');
+    const c = String(city ?? '').trim();
+    if (!c) return ks;
+    // Escape city for regex and test case-insensitively if city already present
+    const escRe = c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`\\b${escRe}\\b`, 'i');
+    if (re.test(ks)) return ks;
+    return `${ks} in ${c}`;
+  };
+
   const keywordRowsHtml = rows.map(r => `
       <tr>
-        <td>${esc(r.keyword)}</td>
+        <td>${esc(addCityToKeyword(r.keyword))}</td>
         <td>${esc(r.yourRanking)}</td>
         <td>${esc(r.topCompetitor)}</td>
         <td>${esc(r.theirRank)}</td>
@@ -277,34 +293,43 @@ function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: stri
 
   // Styles approximating the required format
   const css = `
-  @page { size: A4; margin: 15mm; }
+  @page { size: A4; margin: 12mm 12mm 14mm 12mm; }
   @media print {
-    body { background: #fff !important; }
+    html, body { background: #fff !important; }
     .container { box-shadow: none !important; border: 0; margin: 0; padding: 0; width: 180mm; }
-    .header { border-bottom: 1px solid #ddd; }
+    .header { border-bottom: 1px solid #ddd; break-inside: avoid; page-break-inside: avoid; }
+    .snapshot { break-inside: avoid; page-break-inside: avoid; }
     table { page-break-inside: auto; }
-    tr { page-break-inside: avoid; page-break-after: auto; }
-    h1,h2 { page-break-after: avoid; }
+    thead { display: table-header-group; }
+    tfoot { display: table-footer-group; }
+    tr, td, th { page-break-inside: avoid; }
+    h1, h2, h3 { page-break-after: avoid; orphans: 3; widows: 3; }
   }
-  :root{--card:#ffffff;--muted:#6b7280;--primary:#1e3a8a;--accent:#2563eb;--border:#e5e7eb;--bg:#f8fafc}
-  *{box-sizing:border-box}body{font-family:Inter,system-ui,Arial,Helvetica,sans-serif;background:var(--bg);color:#0f172a;margin:0;padding:24px}
-  .container{max-width:980px;margin:0 auto;background:#fff;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.06);padding:24px}
-  .header{display:flex;align-items:center;justify-content:space-between;padding:8px 4px 20px;border-bottom:1px solid var(--border)}
-  .title{display:flex;align-items:center;gap:12px}
-  .title h1{margin:0;font-size:26px;color:var(--primary);letter-spacing:.4px}
-  .meta{font-size:13px;color:var(--muted)}
-  .snapshot{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:18px 0 8px}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
-  .card h4{margin:0 0 8px;color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.6px}
-  .card .value{font-size:20px;font-weight:700}
-  h2.section{margin:22px 0 12px;font-size:18px;color:#0f172a;display:flex;align-items:center;gap:8px}
-  table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--border);border-radius:12px;overflow:hidden}
-  th,td{padding:10px 12px;border-bottom:1px solid var(--border);font-size:14px}
-  th{background:#f1f5f9;text-align:left;color:#0f172a}
+  :root{--card:#ffffff;--muted:#566074;--primary:#1e3a8a;--accent:#2563eb;--border:#d7dce5;--bg:#f5f7fb}
+  *{box-sizing:border-box;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif}
+  body{background:var(--bg);color:#0f172a;margin:0;padding:32px 0;line-height:1.5}
+  .container{max-width:960px;margin:0 auto;background:#fff;border-radius:24px;box-shadow:0 24px 70px rgba(15,23,42,.08);padding:40px 48px}
+  .header{display:flex;align-items:center;justify-content:space-between;gap:24px;padding-bottom:18px;border-bottom:1px solid rgba(148,163,184,.35)}
+  .leftLogo img{display:block;width:48px;height:auto;border-radius:10px}
+  .center .title{display:flex;flex-direction:column;gap:6px}
+  .center .title h1{margin:0;font-size:28px;color:var(--primary);letter-spacing:.35px}
+  .meta{font-size:14px;color:var(--muted)}
+  .rightLogo img{display:block;width:200px;max-width:240px;height:auto}
+  .snapshot{display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin:28px 0 26px}
+  .card{background:var(--card);border:1px solid rgba(148,163,184,.28);border-radius:16px;padding:20px;box-shadow:0 14px 38px rgba(15,23,42,.06);margin-bottom:24px}
+  .snapshot .card{margin-bottom:0}
+  .card h4{margin:0 0 10px;color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.55px}
+  .card .value{font-size:22px;font-weight:700}
+  h2.section{margin:32px 0 12px;font-size:20px;color:#0f172a;display:flex;align-items:center;gap:10px}
+  h2.section:first-of-type{margin-top:20px}
+  h2.section + *{margin-top:18px}
+  table{width:100%;border-collapse:separate;border-spacing:0;background:#fff;border:1px solid rgba(148,163,184,.25);border-radius:16px;overflow:hidden;box-shadow:0 16px 44px rgba(15,23,42,.06);margin-bottom:28px}
+  th,td{padding:12px 16px;border-bottom:1px solid rgba(148,163,184,.18);font-size:14px}
+  th{background:#f8fafc;text-align:left;color:#0f172a;font-weight:600}
   tr:last-child td{border-bottom:none}
-  .grid-2{display:grid;grid-template-columns:1fr;gap:18px}
+  .grid-2{display:grid;grid-template-columns:1fr;gap:24px}
   @media(min-width:900px){.grid-2{grid-template-columns:1fr}}
-  .note{font-size:12px;color:var(--muted)}
+  .note{font-size:12px;color:var(--muted);background:rgba(148,163,184,.12);padding:12px 16px;border-radius:12px;margin-top:12px}
   `;
 
   return `<!doctype html>
@@ -318,18 +343,25 @@ function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: stri
   <body>
     <div class="container">
       <div class="header">
-        <div class="title">
-          <img alt="Google My Business" src="https://www.gstatic.com/images/icons/material/system_gm/1x/store_mall_directory_gm_blue_24dp.png" width="28"/>
-          <h1>GMB AUDIT REPORT</h1>
+        <div class="leftLogo">
+          <img alt="Google Business Profile" src="assets/google-business-profile.png" data-inline-logo="google" />
         </div>
-        <div class="meta">
-          <div><strong>Profile:</strong> ${esc(biz.name)} — ${esc(biz.category || 'Business')}</div>
-          <div><strong>Location:</strong> ${esc(city || '-')}</div>
-          <div><strong>Audit Date:</strong> ${esc(auditDate)}</div>
+        <div class="center">
+          <div class="title">
+            <h1>GMB AUDIT REPORT</h1>
+          </div>
+          <div class="meta">
+            <div><strong>Profile:</strong> ${esc(biz.name)} — ${esc(biz.category || 'Business')}</div>
+            <div><strong>Location:</strong> ${esc(city || '-')}</div>
+            <div><strong>Audit Date:</strong> ${esc(auditDate)}</div>
+          </div>
+        </div>
+        <div class="rightLogo">
+          <img alt="ConnectAI" src="assets/connectai-logo.png" data-inline-logo="connectai" />
         </div>
       </div>
 
-      <h2 class="section">Snapshot</h2>
+      <h2 class="section">📊 Snapshot</h2>
       <div class="snapshot">
         <div class="card"><h4>Rating</h4><div class="value">${esc(biz.averageRating || 'N/A')}</div></div>
         <div class="card"><h4>Reviews</h4><div class="value">${esc(biz.reviewCount || 'N/A')}</div></div>
@@ -339,7 +371,7 @@ function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: stri
         <div class="card"><h4>“Schedule Now” on GMB</h4><div class="value">${yesNo(biz.scheduleAvailable)}</div></div>
       </div>
 
-      <h2 class="section">Current Keyword Rankings</h2>
+      <h2 class="section">🔑 Current Keyword Rankings</h2>
       <table>
         <thead><tr><th>Keyword</th><th>Your Ranking</th><th>Top Competitor</th><th>Their Rank</th></tr></thead>
         <tbody>
@@ -347,7 +379,7 @@ function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: stri
         </tbody>
       </table>
 
-      <h2 class="section">Competitor Benchmarking — ${esc(city || 'Market')}</h2>
+      <h2 class="section">🏁 Competitor Benchmarking — ${esc(city || 'Market')}</h2>
       <table>
         <thead><tr>
           <th>Profile</th><th>Website</th><th>Directions</th><th>Total Reviews</th><th>Avg. Rating</th><th>Schedule Now</th><th>Call</th>
@@ -356,10 +388,7 @@ function buildStyledHtmlReport(biz: MyBizDetails, rows: RankingRow[], city: stri
           ${competitorRowsHtml}
         </tbody>
       </table>
-      ${narrativeHtml ? `
-      <h2 class="section">Key Insights & Recommendations</h2>
-      <div class="card"><div class="value" style="font-weight:500;font-size:14px;line-height:1.6">${narrativeHtml}</div></div>
-      ` : ''}
+      ${narrativeHtml ? `${narrativeHtml}` : ''}
     </div>
   </body>
   </html>`;
@@ -397,7 +426,6 @@ Using the provided GMB profile data and competitor keyword analysis, generate a 
 ### Base Profile Data
 Profile Title: {{profile_title}}  
 Description: {{profile_description}}  
-Number of GMB Posts: {{num_posts}}  
 Total Reviews: {{total_reviews}}  
 Website: {{website_status}}  
 Directions: {{directions_status}}  
@@ -429,7 +457,6 @@ Make it professional, analytical, and visually structured for a client-facing re
   return template
     .replace('{{profile_title}}', biz.name || 'N/A')
     .replace('{{profile_description}}', descParts || 'N/A')
-    .replace('{{num_posts}}', biz.posts || '0')
     .replace('{{total_reviews}}', biz.reviewCount || '0')
     .replace('{{website_status}}', biz.website ? 'Yes' : 'No')
     .replace('{{directions_status}}', biz.hasDirections ? 'Yes' : 'No')
@@ -449,7 +476,6 @@ function buildNarrativePrompt(
   const summary = {
     name: biz.name,
     city,
-    posts: biz.posts,
     reviews: biz.reviewCount,
     avgRating: biz.averageRating,
     website: !!biz.website,
@@ -494,7 +520,7 @@ DERIVE ACTIONS FROM DATA: Use the inputs to infer gaps and priorities. Examples:
 
 SECTIONS TO OUTPUT (in this order):
 
-<h2 class="section">Keyword Gap & Action Insights</h2>
+<h2 class="section">🔎 Keyword Gap & Action Insights</h2>
 <div class="card">
   <ul>
     <!-- 6-10 bullets derived from inputs (no placeholders). Use labels like <strong>Authority Gap:</strong>, <strong>Conversion Weakness:</strong>, <strong>Missed Services:</strong>. -->
@@ -502,7 +528,7 @@ SECTIONS TO OUTPUT (in this order):
   <div class="note">Base profile vs competitor gaps are inferred from the data; keep each point actionable.</div>
 </div>
 
-<h2 class="section">90-Day Strategic Growth Plan</h2>
+<h2 class="section">📅 90-Day Strategic Growth Plan</h2>
 <div class="card">
   <h4>Month 1: Profile & Trust Setup</h4>
   <ul>
@@ -518,7 +544,7 @@ SECTIONS TO OUTPUT (in this order):
   </ul>
 </div>
 
-<h2 class="section">Final Recommendations</h2>
+<h2 class="section">✅ Final Recommendations</h2>
 <table>
   <thead>
     <tr><th>Priority</th><th>Action</th><th>Impact</th></tr>
@@ -528,7 +554,7 @@ SECTIONS TO OUTPUT (in this order):
   </tbody>
 </table>
 
-<h2 class="section">Connect With Us</h2>
+<h2 class="section">📞 Connect With Us</h2>
 <div class="card">
   <div class="note">
     <!-- Use provided Expert JSON if available; otherwise keep this section minimal. -->
@@ -555,34 +581,170 @@ GUIDELINES:
 `;
 }
 
-async function saveHtmlAndMaybePdf(html: string, profileTitle: string, wantPdf: boolean) {
+async function saveHtmlAndMaybePdf(html: string, profileTitle: string, wantPdf: boolean, expert?: { name?: string; phone?: string; email?: string }) {
   const reportsDir = path.resolve(process.cwd(), 'reports');
   const pdfDir = path.join(reportsDir, 'pdf');
   try { fs.mkdirSync(reportsDir, { recursive: true }); } catch {}
   if (wantPdf) { try { fs.mkdirSync(pdfDir, { recursive: true }); } catch {} }
+  const assetsDir = path.join(reportsDir, 'assets');
+  const assetSourceDirs = [
+    path.resolve(__dirname, '../reports/assets'),
+    path.resolve(__dirname, '../../reports/assets'),
+    path.resolve(process.cwd(), 'apps/admin/reports/assets'),
+    path.resolve(process.cwd(), 'reports/assets'),
+    path.resolve(process.cwd(), '../reports/assets'),
+    path.resolve(__dirname, '../../../reports/assets'),
+  ];
+  try {
+    fs.mkdirSync(assetsDir, { recursive: true });
+    for (const dir of assetSourceDirs) {
+      if (!fs.existsSync(dir)) continue;
+      for (const file of fs.readdirSync(dir)) {
+        const srcPath = path.join(dir, file);
+        const destPath = path.join(assetsDir, file);
+        try {
+          if (!fs.existsSync(destPath)) {
+            fs.copyFileSync(srcPath, destPath);
+          }
+        } catch {}
+      }
+      break;
+    }
+  } catch {}
+
+  const resolveAssetPath = (file: string): string | null => {
+    const candidates = [path.join(assetsDir, file), ...assetSourceDirs.map(dir => path.join(dir, file))];
+    for (const candidate of candidates) {
+      if (candidate && fs.existsSync(candidate)) return candidate;
+    }
+    return null;
+  };
+
+  const toFileUrl = (pth: string) => {
+    let full = path.resolve(pth).replace(/\\/g, '/');
+    if (!full.startsWith('/')) full = '/' + full;
+    return 'file://' + full;
+  };
 
   const safe = (profileTitle || 'Profile').replace(/[^a-z0-9-_]+/gi, '_').slice(0, 80);
-  const htmlPath = path.join(reportsDir, `GMB_Report_${safe}.html`);
-  fs.writeFileSync(htmlPath, html, 'utf-8');
+  const htmlPath = path.join(reportsDir, `${safe}.html`);
+  // Inject print CSS to tighten margins and remove extra padding/shadows for PDF
+  const printCss = `\n<style>
+  @page { margin: 8mm 10mm; }
+  @media print {
+    html, body { padding: 0 !important; margin: 0 !important; background: #ffffff !important; }
+    .container { max-width: 100% !important; padding: 0 0 !important; margin: 0 !important; }
+    .card { box-shadow: none !important; }
+    .header { margin-top: 0 !important; }
+    h1, h2, h3 { margin-top: 8px !important; }
+    .section { margin-top: 10px !important; }
+    table { page-break-inside: auto; }
+    tr { page-break-inside: avoid; page-break-after: auto; }
+    h2.section { page-break-after: avoid; }
+  }
+</style>\n`;
+  let htmlForWrite = html.includes('</head>') ? html.replace('</head>', `${printCss}</head>`) : (html + printCss);
+
+  try {
+    htmlForWrite = htmlForWrite.replace(/src="assets\/([^"]+)"/g, (_match, rel: string) => {
+      const assetPath = path.join(assetsDir, rel);
+      return `src="${toFileUrl(assetPath)}"`;
+    });
+  } catch {}
+
+  try {
+    const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const logoMap: Record<string, string> = {
+      google: 'google-business-profile.png',
+      connectai: 'connectai-logo.png',
+    };
+    for (const [token, filename] of Object.entries(logoMap)) {
+      const assetPath = resolveAssetPath(filename);
+      if (!assetPath) continue;
+      const dataUri = `data:image/png;base64,${fs.readFileSync(assetPath).toString('base64')}`;
+      const selector = new RegExp(`(<img[^>]*data-inline-logo="${escapeRegExp(token)}"[^>]*src=")([^"]+)("[^>]*>)`, 'g');
+      htmlForWrite = htmlForWrite.replace(selector, (_m, pre: string, _old: string, post: string) => `${pre}${dataUri}${post}`);
+    }
+  } catch {}
+
+  try {
+    const remoteImgMatches = Array.from(htmlForWrite.matchAll(/<img[^>]+src="(https?:\/\/[^\"]+)"[^>]*>/gi));
+    if (remoteImgMatches.length) {
+      const replacements = new Map<string, string>();
+      await Promise.all(remoteImgMatches.map(async (m) => {
+        const url = m[1];
+        if (replacements.has(url)) return;
+        try {
+          const resp = typeof fetch === 'function' ? await fetch(url) : null;
+          if (!resp || !('ok' in resp) || !resp.ok) return;
+          const buffer = Buffer.from(await resp.arrayBuffer());
+          const contentType = 'headers' in resp && resp.headers?.get ? resp.headers.get('content-type') : 'image/png';
+          const dataUri = `data:${contentType};base64,${buffer.toString('base64')}`;
+          replacements.set(url, dataUri);
+        } catch {}
+      }));
+      for (const [originalUrl, dataUri] of replacements.entries()) {
+        const escaped = originalUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        htmlForWrite = htmlForWrite.replace(new RegExp(escaped, 'g'), dataUri);
+      }
+    }
+  } catch {}
+
+  // Deterministic injection of expert contact details inside existing Connect With Us note if empty
+  try {
+    if (expert && (expert.name || expert.phone || expert.email)) {
+      const sectionRegex = /(<h2[^>]*>\s*(?:📞\s*)?Connect\s+With\s+Us\s*<\/h2>[\s\S]*?<div class="card">[\s\S]*?<div class="note">)([\s\S]*?)(<\/div>\s*<\/div>)/i;
+      const m = htmlForWrite.match(sectionRegex);
+      if (m) {
+        const inner = (m[2] || '').replace(/\s+/g, ' ').trim();
+        if (!inner) {
+          const lines: string[] = [];
+          if (expert.name) lines.push(`Expert: ${expert.name}<br/>`);
+          if (expert.phone) lines.push(`Phone: ${expert.phone}<br/>`);
+          if (expert.email) lines.push(`Email: ${expert.email}<br/>`);
+          lines.push(`Visit: <a href="https://www.connectai.care/" target="_blank" style="color:#2563EB; text-decoration:underline;">connectai.care</a>`);
+          const contactHtml = lines.join('\n              ');
+          htmlForWrite = htmlForWrite.replace(sectionRegex, `$1\n              ${contactHtml}\n              $3`);
+        }
+      }
+    }
+  } catch {}
+  fs.writeFileSync(htmlPath, htmlForWrite, 'utf-8');
   console.log(`\nSaved HTML report: ${htmlPath}`);
 
   if (!wantPdf) return;
-  const pdfPath = path.join(pdfDir, `GMB_Report_${safe}.pdf`);
-
-  const tryExec = (bin: string, args: string[]) => new Promise<void>((resolve, reject) => {
-    execFile(bin, args, (err) => err ? reject(err) : resolve());
-  });
+  const pdfPath = path.join(pdfDir, `${safe}.pdf`);
 
   try {
-    await tryExec('wkhtmltopdf', [htmlPath, pdfPath]);
-    console.log(`Saved PDF report (wkhtmltopdf): ${pdfPath}`);
-  } catch {
+    const p = await import('puppeteer');
+    const browser = await (p.default || (p as any)).launch({
+      headless: 'new' as any,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser',
+      protocolTimeout: Number(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS) || 120000,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--allow-file-access-from-files',
+        '--enable-local-file-accesses',
+        '--disable-web-security',
+      ],
+    });
+    const page = await browser.newPage();
+    const navTimeout = Number(process.env.PUPPETEER_NAV_TIMEOUT_MS) || 120000;
+    page.setDefaultNavigationTimeout(navTimeout);
+    page.setDefaultTimeout(navTimeout);
+    await page.goto(toFileUrl(htmlPath), { waitUntil: 'load', timeout: navTimeout });
     try {
-      await tryExec('weasyprint', [htmlPath, pdfPath]);
-      console.log(`Saved PDF report (weasyprint): ${pdfPath}`);
-    } catch (e) {
-      console.warn('Failed to render PDF via wkhtmltopdf/weasyprint. HTML saved. Install one of these to enable PDF export.');
-    }
+      await page.waitForFunction(() => Array.from(document.images || []).every(img => img.complete), { timeout: navTimeout });
+    } catch {}
+    await page.pdf({ path: pdfPath, format: 'A4', printBackground: true, preferCSSPageSize: true as any, scale: 0.96, margin: { top: '8mm', right: '10mm', bottom: '8mm', left: '10mm' } });
+    await browser.close();
+    console.log(`Saved PDF report (puppeteer fallback): ${pdfPath}`);
+  } catch (pe) {
+    console.warn('Failed to render PDF via wkhtmltopdf/weasyprint/puppeteer. HTML saved. Install one renderer to enable PDF export.');
+    console.error('Puppeteer fallback error details:', pe);
   }
 }
 
@@ -599,7 +761,6 @@ type MyBizDetails = {
   scheduleAvailable: boolean;
   callAvailable: boolean;
   hasDirections: boolean;
-  posts: string;
 };
 
 async function fetchMyBusinessDetailsFromGoogle(business: string, city: string, mapsUrl?: string): Promise<MyBizDetails | null> {
@@ -634,6 +795,9 @@ const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?
   },
   userDataDir,
 };
+if (!launchOptions.executablePath && DEFAULT_PUPPETEER_EXECUTABLE_PATH) {
+  launchOptions.executablePath = DEFAULT_PUPPETEER_EXECUTABLE_PATH;
+}
 // --- End Launch Options ---
 
 
@@ -719,7 +883,6 @@ const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?
         scheduleAvailable: !!maps.scheduleAvailable,
         callAvailable: !!maps.callAvailable,
         hasDirections: !!maps.hasDirections,
-        posts: cleanVal(maps.posts || '0'),
       } as MyBizDetails;
     } catch (e) {
       console.warn('Failed to fetch details via Maps LHS, falling back to Google search:', (e as Error).message);
@@ -792,7 +955,6 @@ const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?
     // Extract RHS knowledge panel with robust fallbacks (subset of scrapeGoogleSearch RHS logic)
     const rhs = await page.evaluate(() => {
       const get = (sel: string) => (document.querySelector(sel) as HTMLElement | null);
-      const getAll = (sel: string) => Array.from(document.querySelectorAll(sel)) as HTMLElement[];
       const text = (el: Element | null) => (el?.textContent || '').trim();
       const attr = (el: Element | null, a: string) => (el && (el as HTMLElement).getAttribute?.(a)) || '';
 
@@ -868,8 +1030,6 @@ const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?
       const callEl = root.querySelector('a[href^="tel:"], a[aria-label^="Call" i], button[aria-label^="Call" i]') as HTMLElement | null;
       out.callAvailable = !!callEl; out.callBtn = out.callAvailable ? 'Yes' : 'No';
       // Posts (heuristic)
-      const posts = getAll('#rhs a[href*="posts"], #rhs a[href*="/posts"], #rhs [data-attrid*="posts"]');
-      out.posts = String(posts.length || 0);
       return out;
     });
 
@@ -888,7 +1048,6 @@ const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?
     console.log(`- Schedule: ${(rhs?.scheduleAvailable ? 'Yes' : 'No')}`);
     console.log(`- Call: ${(rhs?.callAvailable ? 'Yes' : 'No')}`);
     console.log(`- Directions: ${(rhs?.hasDirections ? 'Yes' : 'No')}`);
-    console.log(`- Posts: ${clean(rhs?.posts || '0')}`);
     try { await browser.close(); } catch {}
     return {
       name: clean(rhs?.name || business),
@@ -902,7 +1061,6 @@ const launchOptions: LaunchOptions & { ignoreHTTPSErrors?: boolean; userDataDir?
       scheduleAvailable: !!rhs?.scheduleAvailable,
       callAvailable: !!rhs?.callAvailable,
       hasDirections: !!rhs?.hasDirections,
-      posts: clean(rhs?.posts || '0'),
     } as MyBizDetails;
   } catch (e) {
     console.warn('Failed to fetch my business details from Google:', (e as Error).message);
@@ -1301,7 +1459,6 @@ export interface CompetitorDetails {
   about?: string;
   services?: string[];
   description?: string;
-  posts?: string;
   scheduleAvailable?: boolean;
   callAvailable?: boolean;
   hasDirections?: boolean;
@@ -1330,7 +1487,7 @@ export interface RankingRow {
 }
 
 // === Args parser ===
-function parseArgs(): { gmbUrl?: string; pdf?: boolean } {
+function parseArgs(): { gmbUrl?: string; pdf?: boolean; expertName?: string; expertPhone?: string; expertEmail?: string } {
   const args = process.argv.slice(2);
   const out: Record<string, string | boolean> = {};
   for (let i = 0; i < args.length; i++) {
@@ -1342,7 +1499,7 @@ function parseArgs(): { gmbUrl?: string; pdf?: boolean } {
       else out[key.replace(/^--/, '')] = true;
     }
   }
-  return out as { gmbUrl?: string; pdf?: boolean };
+  return out as { gmbUrl?: string; pdf?: boolean; expertName?: string; expertPhone?: string; expertEmail?: string };
 }
 
 // Enhanced delay function with more human-like patterns
@@ -2190,7 +2347,6 @@ async function scrapeMapsPlace(page: Page, placeUrl: string) {
     services: [],
     popularTimes: [],
     description: 'N/A',
-    posts: '0',
     scheduleAvailable: false,
     callAvailable: false,
     hasDirections: false,
@@ -2585,54 +2741,6 @@ async function scrapeMapsPlace(page: Page, placeUrl: string) {
         }
       } catch {}
 
-      // Enhanced posts detection with multiple strategies
-      let postsCount = '0';
-      
-      // Strategy 1: Look for posts count in the posts/updates section
-      const postsSection = Array.from(document.querySelectorAll('div, section, button, a'))
-        .find(el => {
-          const text = (el.textContent || '').toLowerCase();
-          return (text.includes('post') || text.includes('update')) && 
-                 (text.match(/\d+/) || text.includes('no posts'));
-        });
-      
-      if (postsSection) {
-        const postsText = postsSection.textContent || '';
-        const postsMatch = postsText.match(/(\d+)/);
-        if (postsMatch) postsCount = postsMatch[1];
-      }
-      
-      // Strategy 2: Look for posts in the business profile section
-      if (postsCount === '0') {
-        const profileSections = Array.from(document.querySelectorAll('[role="main"], [role="article"], [class*="section"], [class*="tabpanel"]'));
-        for (const section of profileSections) {
-          const sectionText = (section.textContent || '').toLowerCase();
-          if (sectionText.includes('posts') || sectionText.includes('updates')) {
-            const postsMatch = sectionText.match(/(\d+)\s*(posts|updates)/i);
-            if (postsMatch) {
-              postsCount = postsMatch[1];
-              break;
-            }
-          }
-        }
-      }
-      
-      // Strategy 3: Look for posts in the navigation/tabs
-      if (postsCount === '0') {
-        const navItems = Array.from(document.querySelectorAll('[role="tab"], [role="navigation"] a, [role="navigation"] button'));
-        const postsNav = navItems.find(el => {
-          const text = (el.textContent || '').toLowerCase();
-          return (text.includes('post') || text.includes('update')) && text.match(/\d+/);
-        });
-        
-        if (postsNav) {
-          const postsMatch = (postsNav.textContent || '').match(/(\d+)/);
-          if (postsMatch) postsCount = postsMatch[1];
-        }
-      }
-      
-      out.posts = postsCount;
-
       // Reviews count: sometimes present in a button near rating
       const reviewsBtn = Array.from(document.querySelectorAll('button, a')).find((el) => {
         const txt = el.textContent || '';
@@ -2800,8 +2908,6 @@ async function scrapeMapsPlace(page: Page, placeUrl: string) {
       result[key] = result[key].replace(/[\n\t\r]+/g, ' ').trim();
     }
   });
-
-  console.log('Extracted competitor details (maps):', JSON.stringify(result, null, 2));
   return result;
 }
 
@@ -2959,6 +3065,9 @@ async function generateScrapedRankings(keywords: KeywordIdea[], businessName: st
     },
     userDataDir,
   };
+  if (!launchOptions.executablePath && DEFAULT_PUPPETEER_EXECUTABLE_PATH) {
+    launchOptions.executablePath = DEFAULT_PUPPETEER_EXECUTABLE_PATH;
+  }
 
   // Try launch; if it fails, retry with common Chrome paths on Windows
   let browser: Browser | null = null;
@@ -3595,7 +3704,6 @@ function getRandomCoordinates(timezone: string): { lat: number; lng: number } {
                 phone: place.phone || competitorDetails.phone || 'N/A',
                 website: place.website || competitorDetails.website || 'N/A',
                 mapsUrl: placeUrl,
-                posts: place.posts || competitorDetails.posts || '0',
                 scheduleAvailable: place.scheduleAvailable ?? competitorDetails.scheduleAvailable,
                 callAvailable: place.callAvailable ?? competitorDetails.callAvailable,
                 hasDirections: place.hasDirections ?? competitorDetails.hasDirections,
@@ -3703,7 +3811,6 @@ function getRandomCoordinates(timezone: string): { lat: number; lng: number } {
                   phone: place.phone || competitorDetails.phone || 'N/A',
                   website: place.website || competitorDetails.website || 'N/A',
                   mapsUrl: mapsHref,
-                  posts: place.posts || competitorDetails.posts || '0',
                   scheduleAvailable: place.scheduleAvailable ?? competitorDetails.scheduleAvailable,
                   callAvailable: place.callAvailable ?? competitorDetails.callAvailable,
                   hasDirections: place.hasDirections ?? competitorDetails.hasDirections,
@@ -4317,22 +4424,6 @@ function printCompetitorTable(rows: RankingRow[]) {
   });
 
   console.table(filteredTableData);
-  
-  // Detailed view for each competitor
-  // console.log('\nDetailed Competitor Information:\n');
-  // tableData.forEach((competitor, index) => {
-  //   console.log(`\n${index + 1}. ${competitor.Competitor}`);
-  //   console.log('─'.repeat(competitor.Competitor.length + 4));
-  //   console.log(`⭐ Rating: ${competitor.Rating} (${competitor.Reviews} reviews)`);
-  //   console.log(`📱 Phone: ${competitor.Phone || '❌ Not Available'}`);
-  //   console.log(`🌐 Website: ${competitor.Website === 'Yes' ? '✅ Available' : '❌ Not Available'}`);
-  //   console.log(`📅 Schedule: ${competitor.Scehule === 'Yes' ? '✅ Available' : '❌ Not Available'}`);
-  //   console.log(`📞 Call: ${competitor.Call === 'Yes' ? '✅ Available' : '❌ Not Available'}`);
-  //   console.log(`🧭 Directions: ${competitor.Directions === 'Yes' ? '✅ Available' : '❌ Not Available'}`);
-  //   console.log(`📝 Posts: ${competitor.Posts || '0'}`);
-  //   console.log(`📍 Address: ${competitor.Address || 'Not available'}`);
-  //   console.log(`🏷️  Category: ${competitor.Category || 'N/A'}`);
-  // });
 }
 
 async function main() {
@@ -4394,13 +4485,18 @@ async function main() {
       const nPrompt = buildNarrativePrompt(detailsForPrompt, rankings, city);
       narrativeHtml = String(await getAiGeneratedText(nPrompt) || '').trim();
     } catch {}
-    const styledHtml = buildStyledHtmlReport(detailsForPrompt, rankings, city, narrativeHtml);
-    await saveHtmlAndMaybePdf(styledHtml, detailsForPrompt.name || business, Boolean(args.pdf));
+    const html = buildStyledHtmlReport(detailsForPrompt, rankings, city, narrativeHtml);
+    const expertDetails = {
+      name: args.expertName,
+      phone: args.expertPhone,
+      email: args.expertEmail
+    };
+    await saveHtmlAndMaybePdf(html, detailsForPrompt.name || business, true, expertDetails);
     // Optional: enable AI-generated HTML via env flag USE_AI_PROMPT=1
     if (process.env.USE_AI_PROMPT === '1') {
       const prompt = buildGmbReportPrompt(detailsForPrompt, rankings);
       const html = await getAiGeneratedText(prompt);
-      await saveHtmlAndMaybePdf(String(html || ''), `${detailsForPrompt.name || business}_AI`, Boolean(args.pdf));
+      await saveHtmlAndMaybePdf(String(html || ''), `${detailsForPrompt.name || business}_AI`, Boolean(args.pdf), expertDetails);
     }
   } catch (e) {
     console.warn('Failed to generate/save GMB report:', (e as Error).message);
